@@ -46,7 +46,7 @@ carry reserved codes on purpose: SMPTE bars write super-black as luma code 0.
 | `/delivering` | 200 while every flow had a read land within the last second, 503 otherwise |
 | `/healthz` | 200 while the process serves. A readiness probe belongs here, not on `/delivering`: a reader waiting for a flow is working as intended. |
 
-Every read lands in exactly one outcome of `mxl_reader_reads_total{result}`,
+Every read lands in exactly one outcome of `mxl_reader_reads_total{result}`, the first that applies in this order,
 counted in grains for video and data and in samples for audio, except
 `too_early` and `too_late`, which count events:
 
@@ -55,9 +55,10 @@ counted in grains for video and data and in samples for audio, except
 | `ok` | read in full, as declared and expected |
 | `too_early` | not there a grace period after it was due: the read span, or the writer's commit batch for samples, plus 50 ms |
 | `too_late` | overwritten before it was read; the reader jumps to the head and adds what it passed to `mxl_reader_skipped_total` |
+| `missing` | the ring slot holds an older cycle's grain: the writer or the mirror never wrote this index |
 | `invalid` | carries the writer's invalid flag |
-| `incomplete` | fewer valid slices than the grain has |
-| `wrong_size` | grain size differs from what the declared v210 geometry needs |
+| `incomplete` | fewer valid slices than the grain has, taken once a later grain exists |
+| `wrong_size` | grain size differs from what the declared v210 geometry needs, one field for an interlaced flow |
 | `wrong_format` | the flow declares other than `--expect` states |
 | `illegal_values` | a sample outside the legal range, with `checkLegal` |
 | `permission_error` | reading was refused |
@@ -71,14 +72,17 @@ failed: `domain` unavailable, flow `not_found`, `permission` denied, or
 opened. `mxl_reader_stalls_total`, `mxl_reader_opens_total`,
 `mxl_reader_lost_total` and `mxl_reader_age_seconds` complete the set.
 
-An id that is not a lowercase flow UUID, or an unreadable `--expect`, exits
-with status 2; a port that cannot be bound exits with status 1.
+An id that is not a lowercase flow UUID, or an `--expect` that is unreadable,
+names a flow not read, or a key the reader does not check, exits with status 2; a port that cannot be bound exits with status 1.
 
 ## Build locally
 
 ```bash
 docker build -t dmf-mf-mxl-reader:dev .
 ```
+
+The build runs `mxl-reader-tests`, the checks in `src/checks.hpp`, and fails
+with them.
 
 `GO_MXL_TAG` and `MXL_REF` move together with `dmf-mf-mxl-writer`'s, so the
 reader links the libmxl the writer and the mxl-k8s gateway run.

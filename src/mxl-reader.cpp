@@ -40,8 +40,14 @@
 #include <mxl/time.h>
 #include <picojson/wrapper.h>
 
+#include "checks.hpp"
+
 namespace
 {
+    using reader::Declared;
+    using reader::Expectation;
+    using reader::GrainOutcome;
+
     std::atomic<bool> stopping{false};
     // Set by a thread that cannot do its job at all, so the process exits
     // non-zero instead of looking like a clean shutdown.
@@ -53,22 +59,6 @@ namespace
     }
 
     constexpr std::uint64_t NsPerSecond = 1'000'000'000ULL;
-
-    // What a reader was told to expect of a flow. Unset fields are not checked.
-    struct Expectation
-    {
-        std::string mediaType;
-        int width = 0;
-        int height = 0;
-        std::string rate;
-        int sampleRate = 0;
-        int channels = 0;
-        // Check every sample against the legal range. Off unless asked: a
-        // test pattern may carry reserved codes on purpose, SMPTE bars write
-        // super-black as luma code 0, and a check that always fires hides the
-        // faults it is there to find.
-        bool checkLegal = false;
-    };
 
     // Where a flow's reader stands, as one word for a page and a metric label.
     enum class State
@@ -109,6 +99,7 @@ namespace
         std::atomic<std::uint64_t> tooEarly{0};
         std::atomic<std::uint64_t> tooLate{0};
         std::atomic<std::uint64_t> skipped{0};
+        std::atomic<std::uint64_t> missing{0};
         std::atomic<std::uint64_t> invalid{0};
         std::atomic<std::uint64_t> incomplete{0};
         std::atomic<std::uint64_t> wrongSize{0};
@@ -213,58 +204,6 @@ namespace
         return std::max(readNs, commitNs) + NsPerSecond / 20;
     }
 
-    // A v210 row packs six pixels into four 32-bit words of three 10-bit
-    // samples, in 128-byte groups of 48 pixels.
-    std::uint64_t v210RowBytes(int width)
-    {
-        return static_cast<std::uint64_t>((width + 47) / 48) * 128;
-    }
-
-    // v210 reserves the codes 0-3 and 1020-1023 for timing references, so a
-    // picture sample there is not a legal value. Three rows are checked per
-    // grain, the active pixels only: a row padded out to 48 pixels carries
-    // zeros past the picture.
-    // Where the first illegal sample sits, or "" when the rows are legal.
-    std::string v210RowsIllegal(std::uint8_t const* payload, int width, int height)
-    {
-        auto const rowBytes = v210RowBytes(width);
-        auto const activeWords = static_cast<std::uint64_t>(width / 6) * 4;
-        for (auto const row : {0, height / 2, height - 1})
-        {
-            auto const* words = reinterpret_cast<std::uint32_t const*>(payload + rowBytes * static_cast<std::uint64_t>(row));
-            for (std::uint64_t w = 0; w < activeWords; ++w)
-            {
-                auto const word = words[w];
-                for (auto const shift : {0U, 10U, 20U})
-                {
-                    auto const sample = (word >> shift) & 0x3ffU;
-                    if (sample < 4 || sample > 1019)
-                    {
-                        return fmt::format("v210 code {} at row {}, word {}, bit {}", sample, row, w, shift);
-                    }
-                }
-            }
-        }
-        return {};
-    }
-
-    // What a flow declares about itself, read from its flow definition.
-    struct Declared
-    {
-        std::string mediaType;
-        int width = 0;
-        int height = 0;
-        std::string rate;
-        int sampleRate = 0;
-        int channels = 0;
-    };
-
-    int jsonInt(picojson::object const& object, char const* key)
-    {
-        auto const it = object.find(key);
-        return (it != object.end() && it->second.is<double>()) ? static_cast<int>(it->second.get<double>()) : 0;
-    }
-
     std::optional<Declared> readDefinition(mxlInstance instance, std::string const& id)
     {
         auto buffer = std::vector<char>(8192);
@@ -279,68 +218,7 @@ namespace
         {
             return std::nullopt;
         }
-        auto json = picojson::value{};
-        if (!picojson::parse(json, buffer.data()).empty() || !json.is<picojson::object>())
-        {
-            return std::nullopt;
-        }
-        auto const& object = json.get<picojson::object>();
-        auto declared = Declared{};
-        if (auto const it = object.find("media_type"); it != object.end() && it->second.is<std::string>())
-        {
-            declared.mediaType = it->second.get<std::string>();
-        }
-        declared.width = jsonInt(object, "frame_width");
-        declared.height = jsonInt(object, "frame_height");
-        declared.channels = jsonInt(object, "channel_count");
-        if (auto const it = object.find("grain_rate"); it != object.end() && it->second.is<picojson::object>())
-        {
-            auto const& r = it->second.get<picojson::object>();
-            auto const den = jsonInt(r, "denominator");
-            declared.rate = fmt::format("{}/{}", jsonInt(r, "numerator"), den > 0 ? den : 1);
-        }
-        if (auto const it = object.find("sample_rate"); it != object.end() && it->second.is<picojson::object>())
-        {
-            declared.sampleRate = jsonInt(it->second.get<picojson::object>(), "numerator");
-        }
-        return declared;
-    }
-
-    // How the flow differs from what was expected, or "" when it does not.
-    std::string mismatch(Declared const& declared, std::optional<Expectation> const& expected)
-    {
-        if (!expected)
-        {
-            return {};
-        }
-        auto out = std::vector<std::string>{};
-        auto const& e = *expected;
-        if (!e.mediaType.empty() && e.mediaType != declared.mediaType)
-        {
-            out.push_back(fmt::format("media type {} where {} was expected", declared.mediaType, e.mediaType));
-        }
-        if ((e.width && e.width != declared.width) || (e.height && e.height != declared.height))
-        {
-            out.push_back(fmt::format("{}x{} where {}x{} was expected", declared.width, declared.height, e.width, e.height));
-        }
-        if (!e.rate.empty() && e.rate != declared.rate)
-        {
-            out.push_back(fmt::format("rate {} where {} was expected", declared.rate, e.rate));
-        }
-        if (e.sampleRate && e.sampleRate != declared.sampleRate)
-        {
-            out.push_back(fmt::format("sample rate {} where {} was expected", declared.sampleRate, e.sampleRate));
-        }
-        if (e.channels && e.channels != declared.channels)
-        {
-            out.push_back(fmt::format("{} channels where {} were expected", declared.channels, e.channels));
-        }
-        auto joined = std::string{};
-        for (auto const& part : out)
-        {
-            joined += (joined.empty() ? "" : "; ") + part;
-        }
-        return joined;
+        return reader::parseDefinition(std::string{buffer.data()});
     }
 
     // libmxl reports a reader it could not open for want of permission as an
@@ -348,15 +226,39 @@ namespace
     bool permissionDenied(std::string const& domain, std::string const& id)
     {
         auto const dir = fmt::format("{}/{}.mxl-flow", domain, id);
-        for (auto const& path : {dir, dir + "/flow_def.json", dir + "/data"})
-        {
+        auto const denied = [](std::string const& path, int mode) {
             struct stat st{};
-            if (::stat(path.c_str(), &st) == 0 && ::access(path.c_str(), R_OK) != 0 && (errno == EACCES || errno == EPERM))
+            return ::stat(path.c_str(), &st) == 0 && ::access(path.c_str(), mode) != 0 && (errno == EACCES || errno == EPERM);
+        };
+        // A directory has to be traversable as well as readable.
+        if (denied(dir, R_OK | X_OK) || denied(dir + "/grains", R_OK | X_OK))
+        {
+            return true;
+        }
+        for (auto const& path : {dir + "/flow_def.json", dir + "/data", dir + "/grains/data.0"})
+        {
+            if (denied(path, R_OK))
             {
                 return true;
             }
         }
         return false;
+    }
+
+    // Returns the status that ended the loop: anything other than a read that
+    // is merely early or late means the reader no longer holds a usable flow.
+    void countGrain(FlowStats& stats, GrainOutcome outcome)
+    {
+        switch (outcome)
+        {
+            case GrainOutcome::Ok:          ++stats.ok; break;
+            case GrainOutcome::WrongFormat: ++stats.wrongFormat; break;
+            case GrainOutcome::Missing:     ++stats.missing; break;
+            case GrainOutcome::Invalid:     ++stats.invalid; break;
+            case GrainOutcome::Incomplete:  ++stats.incomplete; break;
+            case GrainOutcome::WrongSize:   ++stats.wrongSize; break;
+            case GrainOutcome::Illegal:     ++stats.illegal; break;
+        }
     }
 
     // Returns the status that ended the loop: anything other than a read that
@@ -371,10 +273,19 @@ namespace
         auto const timeoutNs = std::max<std::uint64_t>(4 * period, NsPerSecond / 10);
         auto const grace = graceNs(config, period, false);
         auto const checkLegal = stats.expected && stats.expected->checkLegal;
-        auto const v210 = declared.mediaType == "video/v210" && declared.width > 0 && declared.height > 0;
-        auto const expectedSize = v210 ? v210RowBytes(declared.width) * static_cast<std::uint64_t>(declared.height) : 0;
         auto index = headIndex(reader, mxlGetCurrentIndex(&rate));
         auto earlyCounted = std::uint64_t{0};
+        auto const take = [&](mxlGrainInfo const& grain, std::uint8_t const* payload) {
+            auto where = std::string{};
+            auto const outcome = reader::classifyGrain(grain, index, payload, declared, wrongFormat, checkLegal, &where);
+            countGrain(stats, outcome);
+            if (outcome == GrainOutcome::Illegal)
+            {
+                stats.error("illegal sample value: " + where);
+            }
+            markRead(stats, rate, index);
+            ++index;
+        };
         while (!stopping)
         {
             auto grain = mxlGrainInfo{};
@@ -385,45 +296,7 @@ namespace
             auto const status = mxlFlowReaderGetGrainSliceNonBlocking(reader, index, MXL_GRAIN_VALID_SLICES_ALL, &grain, &payload);
             switch (status)
             {
-                case MXL_STATUS_OK:
-                {
-                    auto clean = !wrongFormat;
-                    if (wrongFormat)
-                    {
-                        ++stats.wrongFormat;
-                    }
-                    if ((grain.flags & MXL_GRAIN_FLAG_INVALID) != 0)
-                    {
-                        ++stats.invalid;
-                        clean = false;
-                    }
-                    if (grain.validSlices < grain.totalSlices)
-                    {
-                        ++stats.incomplete;
-                        clean = false;
-                    }
-                    if (v210 && grain.grainSize != expectedSize)
-                    {
-                        ++stats.wrongSize;
-                        clean = false;
-                    }
-                    else if (v210 && checkLegal && payload != nullptr)
-                    {
-                        if (auto const where = v210RowsIllegal(payload, declared.width, declared.height); !where.empty())
-                        {
-                            ++stats.illegal;
-                            clean = false;
-                            stats.error("illegal sample value: " + where);
-                        }
-                    }
-                    if (clean)
-                    {
-                        ++stats.ok;
-                    }
-                    markRead(stats, rate, index);
-                    ++index;
-                    break;
-                }
+                case MXL_STATUS_OK: take(grain, payload); break;
                 case MXL_ERR_OUT_OF_RANGE_TOO_LATE:
                 {
                     // The ring overwrote the grain before it was read: jump to
@@ -436,6 +309,22 @@ namespace
                 }
                 case MXL_ERR_OUT_OF_RANGE_TOO_EARLY:
                 case MXL_ERR_TIMEOUT:
+                {
+                    // A grain the writer moved on from without finishing will
+                    // never be whole: once a later grain is written, take it as
+                    // it stands so it counts as incomplete instead of holding the
+                    // reader until the ring overwrites it.
+                    if (auto const head = headIndex(reader, 0); head > index)
+                    {
+                        auto partial = mxlGrainInfo{};
+                        std::uint8_t* partialPayload = nullptr;
+                        if (mxlFlowReaderGetGrainSliceNonBlocking(reader, index, MXL_GRAIN_VALID_SLICES_ANY, &partial, &partialPayload) ==
+                            MXL_STATUS_OK)
+                        {
+                            take(partial, partialPayload);
+                            break;
+                        }
+                    }
                     // A writer whose clock stepped back leaves its head behind
                     // the index waited on; follow the head once a whole timeout
                     // has passed instead of waiting for the clock to catch up.
@@ -447,34 +336,11 @@ namespace
                         }
                     }
                     break;
-                default:                            return status;
+                }
+                default: return status;
             }
         }
         return MXL_STATUS_OK;
-    }
-
-    bool samplesLegal(mxlWrappedMultiBufferSlice const& slices)
-    {
-        for (std::size_t channel = 0; channel < slices.count; ++channel)
-        {
-            for (auto const& fragment : slices.base.fragments)
-            {
-                if (fragment.pointer == nullptr)
-                {
-                    continue;
-                }
-                auto const* base = static_cast<std::uint8_t const*>(fragment.pointer) + channel * slices.stride;
-                auto const* samples = reinterpret_cast<float const*>(base);
-                for (std::size_t i = 0; i < fragment.size / sizeof(float); ++i)
-                {
-                    if (!std::isfinite(samples[i]) || std::fabs(samples[i]) > 1.0F)
-                    {
-                        return false;
-                    }
-                }
-            }
-        }
-        return true;
     }
 
     mxlStatus readContinuous(mxlFlowReader reader, mxlFlowConfigInfo const& config, Declared const& declared,
@@ -509,7 +375,7 @@ namespace
                     {
                         stats.wrongFormat += batch;
                     }
-                    else if (float32 && !samplesLegal(slices))
+                    else if (float32 && !reader::samplesLegal(slices))
                     {
                         stats.illegal += batch;
                     }
@@ -597,10 +463,22 @@ namespace
 
             auto info = mxlFlowInfo{};
             status = mxlFlowReaderGetInfo(reader, &info);
-            if (status == MXL_STATUS_OK)
+            auto const definition = status == MXL_STATUS_OK ? readDefinition(instance, stats.id) : std::nullopt;
+            if (!definition)
             {
-                auto const declared = readDefinition(instance, stats.id).value_or(Declared{});
-                auto const wrong = mismatch(declared, stats.expected);
+                // Opened but not described: nothing can be checked against an
+                // absent definition, so this is a failure to reach the flow.
+                mxlReleaseFlowReader(instance, reader);
+                ++stats.flowOther;
+                stats.state = State::FlowError;
+                stats.error(status == MXL_STATUS_OK ? std::string{"cannot read the flow definition"}
+                                                    : fmt::format("cannot read the flow info: status {}", static_cast<int>(status)));
+                mxlSleepForNs(NsPerSecond);
+                continue;
+            }
+            {
+                auto const& declared = *definition;
+                auto const wrong = reader::mismatch(declared, stats.expected);
                 {
                     auto const lock = std::lock_guard{stats.mutex};
                     stats.mediaType = declared.mediaType;
@@ -679,6 +557,7 @@ namespace
         {"ok",               &FlowStats::ok},
         {"too_early",        &FlowStats::tooEarly},
         {"too_late",         &FlowStats::tooLate},
+        {"missing",          &FlowStats::missing},
         {"invalid",          &FlowStats::invalid},
         {"incomplete",       &FlowStats::incomplete},
         {"wrong_size",       &FlowStats::wrongSize},
@@ -721,7 +600,7 @@ namespace
             {
                 auto const lock = std::lock_guard{flow->mutex};
                 out += fmt::format("mxl_reader_flow_info{{flow=\"{}\",media_type=\"{}\",unit=\"{}\"}} 1\n", flow->id,
-                    flow->mediaType, flow->continuous ? "samples" : "grains");
+                    reader::labelValue(flow->mediaType), flow->continuous ? "samples" : "grains");
             }
         }
         out += "# HELP mxl_reader_flow_state 1 for the state the flow's reader is in.\n"
@@ -786,10 +665,11 @@ namespace
             auto const& flow = *flows[i];
             auto const lock = std::lock_guard{flow.mutex};
             out += i ? "," : "";
-            out += fmt::format("{{\"id\":{},\"state\":\"{}\",\"delivering\":{},\"unit\":\"{}\",\"mediaType\":{},"
+            out += fmt::format("{{\"id\":{},\"state\":\"{}\",\"delivering\":{},\"unit\":{},\"mediaType\":{},"
                                "\"format\":{},\"formatMismatch\":{},\"ageSeconds\":{},",
                 jsonString(flow.id), stateName(flow.state), delivering(flow) ? "true" : "false",
-                flow.continuous ? "samples" : "grains", jsonString(flow.mediaType), jsonString(flow.format),
+                flow.opens == 0 ? "null" : flow.continuous ? "\"samples\"" : "\"grains\"", jsonString(flow.mediaType),
+                jsonString(flow.format),
                 jsonString(flow.formatMismatch),
                 flow.lastReadAt ? fmt::format("{:.6f}", flow.ageNs / 1e9) : std::string{"null"});
             out += "\"reads\":{";
@@ -901,53 +781,6 @@ namespace
         ::close(fd);
     }
 
-    // --expect '{"<flow id>": {"mediaType": "video/v210", "width": 1920,
-    // "height": 1080, "rate": "50/1", "checkLegal": true}, ...}'; audio takes
-    // sampleRate and channels. Returns an error, or "" when the document is
-    // usable.
-    std::string parseExpectations(std::string const& text, std::map<std::string, Expectation>& out)
-    {
-        if (text.empty())
-        {
-            return {};
-        }
-        auto json = picojson::value{};
-        if (auto const err = picojson::parse(json, text); !err.empty())
-        {
-            return "--expect is not JSON: " + err;
-        }
-        if (!json.is<picojson::object>())
-        {
-            return "--expect must be an object keyed by flow id";
-        }
-        for (auto const& [id, value] : json.get<picojson::object>())
-        {
-            if (!value.is<picojson::object>())
-            {
-                return "--expect: the expectation for " + id + " must be an object";
-            }
-            auto const& o = value.get<picojson::object>();
-            auto e = Expectation{};
-            if (auto const it = o.find("mediaType"); it != o.end() && it->second.is<std::string>())
-            {
-                e.mediaType = it->second.get<std::string>();
-            }
-            if (auto const it = o.find("rate"); it != o.end() && it->second.is<std::string>())
-            {
-                e.rate = it->second.get<std::string>();
-            }
-            e.width = jsonInt(o, "width");
-            e.height = jsonInt(o, "height");
-            e.sampleRate = jsonInt(o, "sampleRate");
-            e.channels = jsonInt(o, "channels");
-            if (auto const it = o.find("checkLegal"); it != o.end() && it->second.is<bool>())
-            {
-                e.checkLegal = it->second.get<bool>();
-            }
-            out[id] = e;
-        }
-        return {};
-    }
 }
 
 int main(int argc, char** argv)
@@ -977,7 +810,7 @@ int main(int argc, char** argv)
         }
     }
     auto expectations = std::map<std::string, Expectation>{};
-    if (auto const err = parseExpectations(expect, expectations); !err.empty())
+    if (auto const err = reader::parseExpectations(expect, flowIds, expectations); !err.empty())
     {
         std::fprintf(stderr, "%s\n", err.c_str());
         return 2;

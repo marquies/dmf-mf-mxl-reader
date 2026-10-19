@@ -29,7 +29,8 @@ RUN cmake -S . -B build \
         -DCMAKE_BUILD_TYPE=Release \
         -DMXL_ENABLE_FABRICS_OFI=ON \
         -DCMAKE_TOOLCHAIN_FILE=/root/vcpkg/scripts/buildsystems/vcpkg.cmake \
-    && cmake --build build --target mxl-reader mxl-info -j
+    && cmake --build build --target mxl-reader mxl-reader-tests mxl-info -j \
+    && build/tools/mxl-reader/mxl-reader-tests
 
 FROM ghcr.io/qvest-digital/go-mxl-runtime:${GO_MXL_TAG}
 
