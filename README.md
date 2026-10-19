@@ -20,31 +20,59 @@ release.
 ## Usage
 
 ```
-mxl-reader -d <domain> -f <flow-id> [-f <flow-id> ...] [-p 9102] [--report-interval 10]
+mxl-reader -d <domain> -f <flow-id> [-f <flow-id> ...] [--expect <json>] [-p 9102] [--report-interval 10]
 ```
 
-A flow that cannot be opened yet, because it is still being mirrored or its
-writer has not started, is retried every second rather than failing the
-process. A flow that goes away is reopened once it is back.
+A domain or flow that cannot be opened yet is retried every second rather than
+failing the process, and a flow that goes away is reopened once it is back.
+
+`--expect` states what each flow should carry, keyed by flow id. A flow that
+declares something else counts every read as `wrong_format`:
+
+```json
+{"<flow id>": {"mediaType": "video/v210", "width": 1920, "height": 1080, "rate": "50/1", "checkLegal": true},
+ "<flow id>": {"mediaType": "audio/float32", "sampleRate": 48000, "channels": 2}}
+```
+
+`checkLegal` also checks sample values: v210 codes 0-3 and 1020-1023, which are
+reserved, in the first, middle and last row of each grain, and float audio
+outside -1..1 or not finite. It is off unless asked, because a test pattern may
+carry reserved codes on purpose: SMPTE bars write super-black as luma code 0.
 
 | path | answers |
 | --- | --- |
-| `/metrics` | Prometheus text, one series per flow |
+| `/status` | JSON, one object per flow: state, declared format, every counter, last error |
+| `/metrics` | Prometheus text, the same counters |
 | `/delivering` | 200 while every flow had a read land within the last second, 503 otherwise |
 | `/healthz` | 200 while the process serves. A readiness probe belongs here, not on `/delivering`: a reader waiting for a flow is working as intended. |
 
-| metric | |
-| --- | --- |
-| `mxl_reader_flow_open` | 1 while a reader holds the flow |
-| `mxl_reader_flow_delivering` | 1 while reads land within a second |
-| `mxl_reader_read_total` | grains (`unit="grains"`) or samples (`unit="samples"`) read; published once the flow has been opened |
-| `mxl_reader_invalid_total` | grains read with the invalid flag set |
-| `mxl_reader_skipped_total` | grains or samples jumped over to reach the head again after the ring overtook the reader; same unit as `read_total` |
-| `mxl_reader_stalls_total` | read timeouts that passed with no read at all, counted once until reads resume |
-| `mxl_reader_opens_total` | times the flow was opened |
-| `mxl_reader_age_seconds` | wall clock minus the media timestamp of the last read |
+Every read lands in exactly one outcome of `mxl_reader_reads_total{result}`,
+counted in grains for video and data and in samples for audio, except
+`too_early` and `too_late`, which count events:
 
-A summary line per flow goes to stderr every `--report-interval` seconds. An id that is not a lowercase flow UUID exits with status 2; a domain that cannot be opened or a port that cannot be bound exits with status 1.
+| result | |
+| --- | --- |
+| `ok` | read in full, as declared and expected |
+| `too_early` | not there a grace period after it was due: the read span, or the writer's commit batch for samples, plus 50 ms |
+| `too_late` | overwritten before it was read; the reader jumps to the head and adds what it passed to `mxl_reader_skipped_total` |
+| `invalid` | carries the writer's invalid flag |
+| `incomplete` | fewer valid slices than the grain has |
+| `wrong_size` | grain size differs from what the declared v210 geometry needs |
+| `wrong_format` | the flow declares other than `--expect` states |
+| `illegal_values` | a sample outside the legal range, with `checkLegal` |
+| `permission_error` | reading was refused |
+| `other_error` | any other read failure; the flow is reopened |
+
+`mxl_reader_open_failures_total{reason}` counts attempts to reach a flow that
+failed: `domain` unavailable, flow `not_found`, `permission` denied, or
+`other`. `mxl_reader_flow_state{state}` names where each flow stands
+(`starting`, `domain_unavailable`, `flow_not_found`, `permission_denied`,
+`flow_error`, `open`), and `mxl_reader_flow_info` its media type and unit once
+opened. `mxl_reader_stalls_total`, `mxl_reader_opens_total`,
+`mxl_reader_lost_total` and `mxl_reader_age_seconds` complete the set.
+
+An id that is not a lowercase flow UUID, or an unreadable `--expect`, exits
+with status 2; a port that cannot be bound exits with status 1.
 
 ## Build locally
 

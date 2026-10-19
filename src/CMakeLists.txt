@@ -16,11 +16,16 @@ if (NOT TARGET fmt::fmt)
     find_package(fmt CONFIG REQUIRED)
 endif ()
 
+if (NOT TARGET picojson::picojson)
+    find_package(picojson REQUIRED)
+endif ()
+
 target_link_libraries(mxl-reader
         PRIVATE
             mxl
             CLI11::CLI11
             fmt::fmt
+            picojson::picojson
     )
 
 set_target_properties(mxl-reader
