@@ -29,21 +29,21 @@ process. A flow that goes away is reopened once it is back.
 | path | answers |
 | --- | --- |
 | `/metrics` | Prometheus text, one series per flow |
-| `/ready` | 200 while every flow had a read land within the last second, 503 otherwise |
-| `/healthz` | 200 while the process serves |
+| `/delivering` | 200 while every flow had a read land within the last second, 503 otherwise |
+| `/healthz` | 200 while the process serves. A readiness probe belongs here, not on `/delivering`: a reader waiting for a flow is working as intended. |
 
 | metric | |
 | --- | --- |
 | `mxl_reader_flow_open` | 1 while a reader holds the flow |
 | `mxl_reader_flow_delivering` | 1 while reads land within a second |
-| `mxl_reader_read_total` | grains (`unit="grains"`) or samples (`unit="samples"`) read |
+| `mxl_reader_read_total` | grains (`unit="grains"`) or samples (`unit="samples"`) read; published once the flow has been opened |
 | `mxl_reader_invalid_total` | grains read with the invalid flag set |
-| `mxl_reader_skipped_total` | grains or samples overwritten before they were read |
-| `mxl_reader_stalls_total` | read timeouts that passed with nothing new to read |
+| `mxl_reader_skipped_total` | grains or samples jumped over to reach the head again after the ring overtook the reader; same unit as `read_total` |
+| `mxl_reader_stalls_total` | read timeouts that passed with no read at all, counted once until reads resume |
 | `mxl_reader_opens_total` | times the flow was opened |
 | `mxl_reader_age_seconds` | wall clock minus the media timestamp of the last read |
 
-A summary line per flow goes to stderr every `--report-interval` seconds.
+A summary line per flow goes to stderr every `--report-interval` seconds. An id that is not a lowercase flow UUID exits with status 2; a domain that cannot be opened or a port that cannot be bound exits with status 1.
 
 ## Build locally
 
