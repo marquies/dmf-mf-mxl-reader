@@ -1,0 +1,29 @@
+# Built inside the dmf-mxl/mxl tree as tools/mxl-reader, so it links the
+# same libmxl target and resolves its dependencies from the same toolchain as
+# the upstream tools.
+
+include(GNUInstallDirs)
+
+add_executable(mxl-reader)
+target_compile_features(mxl-reader PRIVATE cxx_std_20)
+target_sources(mxl-reader PRIVATE mxl-reader.cpp)
+
+if (NOT TARGET CLI11::CLI11)
+    find_package(CLI11 CONFIG REQUIRED)
+endif ()
+
+if (NOT TARGET fmt::fmt)
+    find_package(fmt CONFIG REQUIRED)
+endif ()
+
+target_link_libraries(mxl-reader
+        PRIVATE
+            mxl
+            CLI11::CLI11
+            fmt::fmt
+    )
+
+set_target_properties(mxl-reader
+        PROPERTIES
+            INSTALL_RPATH "${MXL_TOOLS_INSTALL_RPATH}"
+    )
