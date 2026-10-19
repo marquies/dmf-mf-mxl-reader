@@ -11,7 +11,8 @@ a [`dmf-mxl/mxl`](https://github.com/dmf-mxl/mxl) tree against the
 
 ## Image
 
-`ghcr.io/qvest-digital/dmf-mf-mxl-reader:<tag>`
+`ghcr.io/marquies/dmf-mf-mxl-reader:<tag>`, named after the repository that
+builds it.
 
 Tags follow `<git-sha>` (every build), `latest` (main only), and `<version>` on
 release.
