@@ -40,7 +40,9 @@ declares something else counts every read as `wrong_format`:
 The ring view draws each flow's ring with a slot per grain, coloured by when
 its last grain arrived against its media timestamp: within a grain period,
 within the too-early grace, or later, or by what was wrong with it. Markers
-show the head and the reader. A strip beside it plots every grain of the last
+show the head and the reader. Below it: the number of slots, the payload of
+one slot (a grain, or one sample of every channel), the payload of the whole
+ring, and the media time the ring holds. A strip beside it plots every grain of the last
 six seconds on a log scale from 0.1 ms to 1 s: when the reader saw it, and when
 it was committed on this node, which libmxl records for the flow's head and so
 is known for a grain read while it is the head. Audio writers record no commit
@@ -58,7 +60,7 @@ carry reserved codes on purpose: SMPTE bars write super-black as luma code 0.
 | path | answers |
 | --- | --- |
 | `/` | the ring view, a page drawing each flow's ring from `/stream` |
-| `/stream` | server-sent events, 20 batches a second: per flow its ring length, period, grace, reader and head index, and every grain read since the last batch as `[index, seen ms, arrival ms, commit ms or null, behind head, kind, count]`; at most 8 at once |
+| `/stream` | server-sent events, 20 batches a second: per flow its ring length, the payload bytes of one slot, period, grace, reader and head index, and every grain read since the last batch as `[index, seen ms, arrival ms, commit ms or null, behind head, kind, count]`; at most 8 at once |
 | `/status` | JSON, one object per flow: state, declared format, every counter, last error |
 | `/metrics` | Prometheus text, the same counters |
 | `/delivering` | 200 while every flow had a read land within the last second, 503 otherwise |
