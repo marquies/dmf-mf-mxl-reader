@@ -15,6 +15,8 @@ ARG MXL_REF=4a8a50e7
 FROM ghcr.io/qvest-digital/go-mxl-builder:${GO_MXL_TAG} AS build
 ARG MXL_REF
 ARG MXL_SRC
+# What the binary reports as its version: the release, or the commit.
+ARG VERSION=dev
 
 WORKDIR /src
 # A full clone: GitHub refuses a shallow fetch of an arbitrary commit by SHA.
@@ -29,6 +31,7 @@ RUN cmake -S . -B build \
         -DCMAKE_BUILD_TYPE=Release \
         -DMXL_ENABLE_FABRICS_OFI=ON \
         -DCMAKE_TOOLCHAIN_FILE=/root/vcpkg/scripts/buildsystems/vcpkg.cmake \
+        -DMXL_READER_VERSION="${VERSION}" \
     && cmake --build build --target mxl-reader mxl-reader-tests mxl-info -j \
     && build/tools/mxl-reader/mxl-reader-tests
 
