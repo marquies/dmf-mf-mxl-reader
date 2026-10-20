@@ -18,6 +18,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <deque>
+#include <limits>
 #include <cerrno>
 #include <cmath>
 #include <csignal>
@@ -41,6 +44,7 @@
 #include <picojson/wrapper.h>
 
 #include "checks.hpp"
+#include "page.hpp"
 
 namespace
 {
@@ -98,6 +102,31 @@ namespace
         return "unknown";
     }
 
+    // One thing that happened to a flow, for the ring view: a grain or a batch
+    // of samples read, or a timing event. Times are TAI nanoseconds, latencies
+    // relative to the media timestamp of the index.
+    struct GrainEvent
+    {
+        std::uint64_t seq = 0;
+        std::uint64_t index = 0;
+        std::uint64_t seenNs = 0;
+        std::int64_t arrivalNs = 0;
+        // Committed on this node, by the writer or the mirror. Known only for a
+        // grain read while it is the head: libmxl stamps the flow, not the
+        // grain, with its last write.
+        std::int64_t commitNs = Unknown;
+        std::int64_t behind = 0;
+        // k ok, f wrong format, m missing, v invalid, p incomplete, s wrong
+        // size, x illegal values, l too late, e too early, t stall.
+        char kind = 'k';
+        std::uint64_t count = 1;
+
+        static constexpr std::int64_t Unknown = std::numeric_limits<std::int64_t>::min();
+    };
+
+    // The ring view's window: enough for several seconds of a 240/1 flow.
+    constexpr std::size_t EventsKept = 4096;
+
     struct FlowStats
     {
         std::string id;
@@ -135,6 +164,15 @@ namespace
         std::atomic<bool> stallCounted{false};
         std::atomic<std::int64_t> ageNs{0};
 
+        // What the ring view draws against: the ring's length in grains or
+        // samples, one grain or sample period, the too-early grace, and where
+        // the reader and the head stand.
+        std::atomic<std::uint64_t> ringLength{0};
+        std::atomic<std::uint64_t> periodNs{0};
+        std::atomic<std::uint64_t> graceNs{0};
+        std::atomic<std::uint64_t> readerIndex{0};
+        std::atomic<std::uint64_t> headSeen{0};
+
         // Read by the HTTP thread, written by the flow's own.
         mutable std::mutex mutex;
         std::string mediaType;
@@ -142,6 +180,19 @@ namespace
         std::string formatMismatch;
         std::string lastError;
         std::uint64_t lastErrorAt = 0;
+        std::deque<GrainEvent> events;
+        std::uint64_t eventSeq = 0;
+
+        void record(GrainEvent event)
+        {
+            auto const lock = std::lock_guard{mutex};
+            event.seq = ++eventSeq;
+            events.push_back(event);
+            if (events.size() > EventsKept)
+            {
+                events.pop_front();
+            }
+        }
 
         void error(std::string message)
         {
@@ -193,15 +244,18 @@ namespace
         std::uint64_t timeoutNs, std::uint64_t& earlyCounted)
     {
         auto const now = mxlGetTime();
-        if (earlyCounted != index && now > mxlIndexToTimestamp(&rate, index) + graceNs)
+        auto const due = mxlIndexToTimestamp(&rate, index);
+        if (earlyCounted != index && now > due + graceNs)
         {
             ++stats.tooEarly;
             earlyCounted = index;
+            stats.record({.index = index, .seenNs = now, .arrivalNs = static_cast<std::int64_t>(now - due), .kind = 'e'});
         }
         auto const timedOut = now - stats.lastProgressAt >= timeoutNs;
         if (timedOut && !stats.stallCounted.exchange(true))
         {
             ++stats.stalls;
+            stats.record({.index = index, .seenNs = now, .arrivalNs = static_cast<std::int64_t>(now - due), .kind = 't'});
         }
         mxlSleepForNs(std::clamp<std::uint64_t>(mxlGetNsUntilIndex(index, &rate), NsPerSecond / 1000, NsPerSecond / 200));
         return timedOut;
@@ -274,6 +328,43 @@ namespace
         }
     }
 
+    char kindOf(GrainOutcome outcome)
+    {
+        switch (outcome)
+        {
+            case GrainOutcome::Ok:          return 'k';
+            case GrainOutcome::WrongFormat: return 'f';
+            case GrainOutcome::Missing:     return 'm';
+            case GrainOutcome::Invalid:     return 'v';
+            case GrainOutcome::Incomplete:  return 'p';
+            case GrainOutcome::WrongSize:   return 's';
+            case GrainOutcome::Illegal:     return 'x';
+        }
+        return 'k';
+    }
+
+    // The event for an index just read: when it was seen, and, when it is the
+    // head, when it was committed on this node.
+    GrainEvent readEvent(mxlFlowReader reader, mxlRational const& rate, std::uint64_t index, char kind, std::uint64_t count,
+        FlowStats& stats)
+    {
+        auto const now = mxlGetTime();
+        auto const due = static_cast<std::int64_t>(mxlIndexToTimestamp(&rate, index));
+        auto event = GrainEvent{.index = index, .seenNs = now, .arrivalNs = static_cast<std::int64_t>(now) - due, .kind = kind, .count = count};
+        auto runtime = mxlFlowRuntimeInfo{};
+        if (mxlFlowReaderGetRuntimeInfo(reader, &runtime) == MXL_STATUS_OK)
+        {
+            stats.headSeen = runtime.headIndex;
+            event.behind = static_cast<std::int64_t>(runtime.headIndex) - static_cast<std::int64_t>(index);
+            if (runtime.headIndex == index && runtime.lastWriteTime != 0)
+            {
+                event.commitNs = static_cast<std::int64_t>(runtime.lastWriteTime) - due;
+            }
+        }
+        stats.readerIndex = index;
+        return event;
+    }
+
     // Returns the status that ended the loop: anything other than a read that
     // is merely early or late means the reader no longer holds a usable flow.
     mxlStatus readDiscrete(mxlFlowReader reader, mxlFlowConfigInfo const& config, Declared const& declared, bool wrongFormat,
@@ -286,6 +377,9 @@ namespace
         auto const timeoutNs = std::max<std::uint64_t>(4 * period, NsPerSecond / 10);
         auto const grace = graceNs(config, period, false);
         auto const checkLegal = stats.expected && stats.expected->checkLegal;
+        stats.ringLength = config.discrete.grainCount;
+        stats.periodNs = period;
+        stats.graceNs = grace;
         auto index = headIndex(reader, mxlGetCurrentIndex(&rate));
         auto earlyCounted = std::uint64_t{0};
         auto const take = [&](mxlGrainInfo const& grain, std::uint8_t const* payload) {
@@ -296,6 +390,7 @@ namespace
             {
                 stats.error("illegal sample value: " + where);
             }
+            stats.record(readEvent(reader, rate, index, kindOf(outcome), 1, stats));
             markRead(stats, rate, index);
             ++index;
         };
@@ -317,6 +412,8 @@ namespace
                     ++stats.tooLate;
                     auto const head = headIndex(reader, mxlGetCurrentIndex(&rate));
                     stats.skipped += head > index ? head - index : 1;
+                    stats.record({.index = index, .seenNs = mxlGetTime(), .behind = static_cast<std::int64_t>(head - index), .kind = 'l',
+                        .count = head > index ? head - index : 1});
                     index = head > index ? head : index + 1;
                     break;
                 }
@@ -368,8 +465,11 @@ namespace
             batch = std::max<std::uint64_t>(batch, config.common.maxSyncBatchSizeHint);
         }
         auto const batchNs = batch * periodNs(rate);
+        stats.ringLength = config.continuous.bufferLength;
+        stats.periodNs = periodNs(rate);
         auto const timeoutNs = std::max<std::uint64_t>(4 * batchNs, NsPerSecond / 10);
         auto const grace = graceNs(config, batchNs, true);
+        stats.graceNs = grace;
         auto const float32 = declared.mediaType == "audio/float32" && stats.expected && stats.expected->checkLegal;
         auto index = headIndex(reader, mxlGetCurrentIndex(&rate));
         auto earlyCounted = std::uint64_t{0};
@@ -384,26 +484,34 @@ namespace
             switch (status)
             {
                 case MXL_STATUS_OK:
+                {
+                    auto kind = 'k';
                     if (wrongFormat)
                     {
                         stats.wrongFormat += batch;
+                        kind = 'f';
                     }
                     else if (float32 && !reader::samplesLegal(slices))
                     {
                         stats.illegal += batch;
+                        kind = 'x';
                     }
                     else
                     {
                         stats.ok += batch;
                     }
+                    stats.record(readEvent(reader, rate, next, kind, batch, stats));
                     markRead(stats, rate, next);
                     index = next;
                     break;
+                }
                 case MXL_ERR_OUT_OF_RANGE_TOO_LATE:
                 {
                     ++stats.tooLate;
                     auto const head = headIndex(reader, mxlGetCurrentIndex(&rate));
                     stats.skipped += head > index ? head - index : batch;
+                    stats.record({.index = index, .seenNs = mxlGetTime(), .behind = static_cast<std::int64_t>(head - index), .kind = 'l',
+                        .count = head > index ? head - index : batch});
                     index = head > index ? head : next;
                     break;
                 }
@@ -672,7 +780,7 @@ namespace
     std::string status(std::vector<std::unique_ptr<FlowStats>> const& flows)
     {
         auto const now = mxlGetTime();
-        std::string out = "{\"flows\":[";
+        std::string out = fmt::format("{{\"version\":{},\"flows\":[", jsonString(versionText()));
         for (std::size_t i = 0; i < flows.size(); ++i)
         {
             auto const& flow = *flows[i];
@@ -705,6 +813,79 @@ namespace
                                     : std::string{",\"lastError\":null}"};
         }
         return out + "]}";
+    }
+
+    double ms(std::int64_t ns)
+    {
+        return static_cast<double>(ns) / 1e6;
+    }
+
+    // One batch for the ring view: per flow, what it is drawn against and the
+    // events since the cursor. An event is [index, seen ms, arrival ms,
+    // commit ms or null, behind head, kind, count].
+    std::string streamBatch(std::vector<std::unique_ptr<FlowStats>> const& flows, std::vector<std::uint64_t>& cursors)
+    {
+        auto out = fmt::format("{{\"now\":{:.3f},\"flows\":[", ms(static_cast<std::int64_t>(mxlGetTime())));
+        for (std::size_t i = 0; i < flows.size(); ++i)
+        {
+            auto const& flow = *flows[i];
+            auto const lock = std::lock_guard{flow.mutex};
+            out += fmt::format("{}{{\"id\":{},\"label\":{},\"unit\":\"{}\",\"state\":\"{}\",\"ring\":{},\"periodMs\":{:.4f},"
+                               "\"graceMs\":{:.3f},\"reader\":{},\"head\":{},\"ev\":[",
+                i ? "," : "", jsonString(flow.id), jsonString(flow.format), flow.continuous ? "samples" : "grains",
+                stateName(flow.state), flow.ringLength.load(), ms(static_cast<std::int64_t>(flow.periodNs.load())),
+                ms(static_cast<std::int64_t>(flow.graceNs.load())), flow.readerIndex.load(), flow.headSeen.load());
+            auto first = true;
+            for (auto const& e : flow.events)
+            {
+                if (e.seq <= cursors[i])
+                {
+                    continue;
+                }
+                out += fmt::format("{}[{},{:.3f},{:.3f},{},{},\"{}\",{}]", first ? "" : ",", e.index, ms(static_cast<std::int64_t>(e.seenNs)),
+                    ms(e.arrivalNs), e.commitNs == GrainEvent::Unknown ? std::string{"null"} : fmt::format("{:.3f}", ms(e.commitNs)),
+                    e.behind, e.kind, e.count);
+                first = false;
+            }
+            cursors[i] = flow.eventSeq;
+            out += "]}";
+        }
+        return out + "]}";
+    }
+
+    std::atomic<int> streams{0};
+    // Each open ring view costs a thread and a batch every 50 ms.
+    constexpr int MaxStreams = 8;
+
+    // Server-sent events for the ring view, 20 batches a second, on a thread
+    // of its own so a viewer never holds up the probes or /status. A new viewer
+    // gets the last five seconds first, so the view has something to draw.
+    void streamClient(int client, std::vector<std::unique_ptr<FlowStats>> const& flows)
+    {
+        auto const header = std::string{"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
+                                        "Connection: keep-alive\r\nX-Accel-Buffering: no\r\n\r\n"};
+        auto sent = ::send(client, header.data(), header.size(), MSG_NOSIGNAL) > 0;
+        auto cursors = std::vector<std::uint64_t>(flows.size(), 0);
+        auto const since = mxlGetTime() - 5 * NsPerSecond;
+        for (std::size_t i = 0; i < flows.size(); ++i)
+        {
+            auto const lock = std::lock_guard{flows[i]->mutex};
+            for (auto const& e : flows[i]->events)
+            {
+                if (e.seenNs < since)
+                {
+                    cursors[i] = e.seq;
+                }
+            }
+        }
+        while (sent && !stopping)
+        {
+            auto const message = "data: " + streamBatch(flows, cursors) + "\n\n";
+            sent = ::send(client, message.data(), message.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(message.size());
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        ::close(client);
+        --streams;
     }
 
     void serve(int port, std::vector<std::unique_ptr<FlowStats>> const& flows)
@@ -754,10 +935,32 @@ namespace
             auto const target = line.starts_with("GET ") ? line.substr(4, line.find(' ', 4) - 4) : std::string{};
             auto const path = target.substr(0, target.find('?'));
 
+            if (path == "/stream")
+            {
+                if (streams.fetch_add(1) < MaxStreams)
+                {
+                    auto const streamTv = timeval{.tv_sec = 2, .tv_usec = 0};
+                    ::setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &streamTv, sizeof(streamTv));
+                    std::thread{streamClient, client, std::cref(flows)}.detach();
+                    continue;
+                }
+                --streams;
+            }
+
             auto code = 200;
             auto type = std::string{"text/plain; version=0.0.4"};
             std::string body;
-            if (path == "/metrics")
+            if (path == "/")
+            {
+                body = RingPage;
+                type = "text/html; charset=utf-8";
+            }
+            else if (path == "/stream")
+            {
+                code = 503;
+                body = fmt::format("at most {} ring views at once\n", MaxStreams);
+            }
+            else if (path == "/metrics")
             {
                 body = metrics(flows);
             }

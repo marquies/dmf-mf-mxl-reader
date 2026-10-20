@@ -37,6 +37,19 @@ declares something else counts every read as `wrong_format`:
  "<flow id>": {"mediaType": "audio/float32", "sampleRate": 48000, "channels": 2}}
 ```
 
+The ring view draws each flow's ring with a slot per grain, coloured by when
+its last grain arrived against its media timestamp: within a grain period,
+within the too-early grace, or later, or by what was wrong with it. Markers
+show the head and the reader. A strip beside it plots every grain of the last
+six seconds on a log scale from 0.1 ms to 1 s: when the reader saw it, and when
+it was committed on this node, which libmxl records for the flow's head and so
+is known for a grain read while it is the head. Audio writers record no commit
+time. A port-forward to 9102 is enough to open it:
+
+```
+kubectl -n <namespace> port-forward svc/<reader claim> 9102
+```
+
 `checkLegal` also checks sample values: v210 codes 0-3 and 1020-1023, which are
 reserved, in the first, middle and last row of each grain, and float audio
 outside -1..1 or not finite. It is off unless asked, because a test pattern may
@@ -44,6 +57,8 @@ carry reserved codes on purpose: SMPTE bars write super-black as luma code 0.
 
 | path | answers |
 | --- | --- |
+| `/` | the ring view, a page drawing each flow's ring from `/stream` |
+| `/stream` | server-sent events, 20 batches a second: per flow its ring length, period, grace, reader and head index, and every grain read since the last batch as `[index, seen ms, arrival ms, commit ms or null, behind head, kind, count]`; at most 8 at once |
 | `/status` | JSON, one object per flow: state, declared format, every counter, last error |
 | `/metrics` | Prometheus text, the same counters |
 | `/delivering` | 200 while every flow had a read land within the last second, 503 otherwise |
