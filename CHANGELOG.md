@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.0.0-rc.3](https://github.com/marquies/dmf-mf-mxl-reader/compare/v1.0.0-rc.2...v1.0.0-rc.3) (2026-10-20)
+
+
+### Features
+
+* name the reader's version and libmxl at start and on --version ([96ec4ea](https://github.com/marquies/dmf-mf-mxl-reader/commit/96ec4eae00d0d1a668ae6046ed7dcef0b0c8c19b))
+* name the reader's version and libmxl at start and on --version ([06c1620](https://github.com/marquies/dmf-mf-mxl-reader/commit/06c1620570729eeb2812287fa88f12fd0f2a0e59))
+* show each flow's ring and where its grains arrive, live ([65bff6d](https://github.com/marquies/dmf-mf-mxl-reader/commit/65bff6d64c9fdcfec7806d513cae2e54e48550cd))
+* show each flow's ring and where its grains arrive, live ([b5ef374](https://github.com/marquies/dmf-mf-mxl-reader/commit/b5ef3741bbdb4e531c90885baa96022c07659b1d))
+
 ## [1.0.0-rc.2](https://github.com/marquies/dmf-mf-mxl-reader/compare/v1.0.0-rc.1...v1.0.0-rc.2) (2026-10-20)
 
 
