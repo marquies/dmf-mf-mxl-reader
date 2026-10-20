@@ -110,7 +110,9 @@ const colorFor = (ev, meta) => {
 function segments(meta) { return Math.max(1, Math.min(meta.ring || 1, 360)); }
 function segmentOf(index, meta) {
   const ring = meta.ring || 1;
-  return Math.floor((index % ring) / ring * segments(meta));
+  // Multiply before dividing: (k / ring) * slots rounds just below a whole
+  // number for some k, which leaves a slot that never receives a grain.
+  return Math.floor((index % ring) * segments(meta) / ring);
 }
 
 function onBatch(batch) {
