@@ -165,9 +165,12 @@ namespace
         std::atomic<std::int64_t> ageNs{0};
 
         // What the ring view draws against: the ring's length in grains or
-        // samples, one grain or sample period, the too-early grace, and where
-        // the reader and the head stand.
+        // samples, the payload bytes of one slot (a grain, or one sample of
+        // every channel), one grain or sample period, the too-early grace, and
+        // where the reader and the head stand. The slot size is known once a
+        // read has returned data.
         std::atomic<std::uint64_t> ringLength{0};
+        std::atomic<std::uint64_t> slotBytes{0};
         std::atomic<std::uint64_t> periodNs{0};
         std::atomic<std::uint64_t> graceNs{0};
         std::atomic<std::uint64_t> readerIndex{0};
@@ -390,6 +393,10 @@ namespace
             {
                 stats.error("illegal sample value: " + where);
             }
+            if (grain.grainSize > 0)
+            {
+                stats.slotBytes = grain.grainSize;
+            }
             stats.record(readEvent(reader, rate, index, kindOf(outcome), 1, stats));
             markRead(stats, rate, index);
             ++index;
@@ -485,6 +492,15 @@ namespace
             {
                 case MXL_STATUS_OK:
                 {
+                    auto channelBytes = std::uint64_t{0};
+                    for (auto const& fragment : slices.base.fragments)
+                    {
+                        channelBytes += fragment.size;
+                    }
+                    if (channelBytes > 0)
+                    {
+                        stats.slotBytes = channelBytes / batch * slices.count;
+                    }
                     auto kind = 'k';
                     if (wrongFormat)
                     {
@@ -830,10 +846,10 @@ namespace
         {
             auto const& flow = *flows[i];
             auto const lock = std::lock_guard{flow.mutex};
-            out += fmt::format("{}{{\"id\":{},\"label\":{},\"unit\":\"{}\",\"state\":\"{}\",\"ring\":{},\"periodMs\":{:.4f},"
+            out += fmt::format("{}{{\"id\":{},\"label\":{},\"unit\":\"{}\",\"state\":\"{}\",\"ring\":{},\"slotBytes\":{},\"periodMs\":{:.4f},"
                                "\"graceMs\":{:.3f},\"reader\":{},\"head\":{},\"ev\":[",
                 i ? "," : "", jsonString(flow.id), jsonString(flow.format), flow.continuous ? "samples" : "grains",
-                stateName(flow.state), flow.ringLength.load(), ms(static_cast<std::int64_t>(flow.periodNs.load())),
+                stateName(flow.state), flow.ringLength.load(), flow.slotBytes.load(), ms(static_cast<std::int64_t>(flow.periodNs.load())),
                 ms(static_cast<std::int64_t>(flow.graceNs.load())), flow.readerIndex.load(), flow.headSeen.load());
             auto first = true;
             for (auto const& e : flow.events)

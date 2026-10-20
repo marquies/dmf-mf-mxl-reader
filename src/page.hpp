@@ -37,6 +37,8 @@ namespace
   .num .k { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--dim); }
   .num .v { font-size: 22px; font-weight: 800; font-variant-numeric: tabular-nums; }
   .num .v small { font-size: 12px; font-weight: 600; color: var(--dim); }
+  .ringinfo { margin-top: 12px; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .ringinfo .num .v { font-size: 17px; }
   .strip canvas { width: 100%; height: 240px; display: block; }
   .legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px; color: var(--dim); margin-top: 8px; }
   .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
@@ -59,6 +61,7 @@ namespace
   <section class="panel ring">
     <h2 id="ringTitle">Ring</h2>
     <canvas id="ring" width="900" height="900"></canvas>
+    <div class="numbers ringinfo" id="ringInfo"></div>
     <div class="legend">
       <span><i style="background:var(--ok)"></i>within a period</span>
       <span><i style="background:var(--warn)"></i>within the grace</span>
@@ -148,6 +151,32 @@ function renderTabs() {
     b.onclick = () => { selected = id; renderTabs(); };
     tabs.appendChild(b);
   }
+}
+
+function fmtBytes(n) {
+  if (!n) return ['--', ''];
+  if (n >= 1e9) return [(n / 1e9).toFixed(2), 'GB'];
+  if (n >= 1e6) return [(n / 1e6).toFixed(n >= 1e8 ? 0 : 1), 'MB'];
+  if (n >= 1e3) return [(n / 1e3).toFixed(1), 'KB'];
+  return [String(n), 'B'];
+}
+
+// The ring itself: how many slots, the payload of one, all of them, and how
+// much media time that holds.
+function drawRingInfo(meta) {
+  const ring = meta.ring || 0;
+  const slot = fmtBytes(meta.slotBytes);
+  const total = fmtBytes(ring * (meta.slotBytes || 0));
+  const span = ring && meta.periodMs ? ring * meta.periodMs / 1000 : null;
+  const cells = [
+    ['slots', ring || '--', meta.unit === 'samples' ? 'samples' : 'grains'],
+    ['slot size', slot[0], slot[1]],
+    ['ring total', total[0], total[1]],
+    ['history', span === null ? '--' : span.toFixed(2), 's'],
+  ];
+  document.getElementById('ringInfo').innerHTML = cells
+    .map(([k, v, u]) => `<div class="num"><div class="k">${k}</div><div class="v">${v} <small>${u}</small></div></div>`)
+    .join('');
 }
 
 function percentile(sorted, p) {
@@ -303,6 +332,7 @@ function frame() {
     if (Date.now() - numbersAt > 250) {
       numbersAt = Date.now();
       drawNumbers(flow, now);
+      drawRingInfo(flow.meta);
     }
   }
   requestAnimationFrame(frame);
