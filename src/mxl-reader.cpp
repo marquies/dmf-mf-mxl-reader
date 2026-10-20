@@ -60,6 +60,19 @@ namespace
 
     constexpr std::uint64_t NsPerSecond = 1'000'000'000ULL;
 
+#ifndef MXL_READER_VERSION
+#define MXL_READER_VERSION "dev"
+#endif
+
+    // This build and the libmxl it runs against: the second is what decides
+    // how a flow is read, and the image's own tag does not name it.
+    std::string versionText()
+    {
+        auto lib = mxlVersionType{};
+        mxlGetVersion(&lib);
+        return fmt::format("mxl-reader {} (libmxl {})", MXL_READER_VERSION, lib.full != nullptr ? lib.full : "unknown");
+    }
+
     // Where a flow's reader stands, as one word for a page and a metric label.
     enum class State
     {
@@ -786,6 +799,7 @@ namespace
 int main(int argc, char** argv)
 {
     auto app = CLI::App{"mxl-reader"};
+    app.set_version_flag("--version", versionText());
     auto domain = std::string{};
     app.add_option("-d,--domain", domain, "The MXL domain directory.")->required();
     auto flowIds = std::vector<std::string>{};
@@ -818,6 +832,9 @@ int main(int argc, char** argv)
 
     std::signal(SIGTERM, onSignal);
     std::signal(SIGINT, onSignal);
+
+    std::fprintf(stderr, "%s, reading %zu flow%s from %s, serving on :%d\n", versionText().c_str(), flowIds.size(),
+        flowIds.size() == 1 ? "" : "s", domain.c_str(), port);
 
     auto flows = std::vector<std::unique_ptr<FlowStats>>{};
     for (auto const& id : flowIds)

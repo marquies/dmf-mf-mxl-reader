@@ -23,6 +23,9 @@ release.
 mxl-reader -d <domain> -f <flow-id> [-f <flow-id> ...] [--expect <json>] [-p 9102] [--report-interval 10]
 ```
 
+The first line on stderr names the reader's version and the libmxl it runs
+against; `--version` prints the same and exits.
+
 A domain or flow that cannot be opened yet is retried every second rather than
 failing the process, and a flow that goes away is reopened once it is back.
 

@@ -8,6 +8,11 @@ add_executable(mxl-reader)
 target_compile_features(mxl-reader PRIVATE cxx_std_20)
 target_sources(mxl-reader PRIVATE mxl-reader.cpp)
 
+# The release version, or the commit, the image is built from; the binary
+# prints it at start and on --version.
+set(MXL_READER_VERSION "dev" CACHE STRING "Version mxl-reader reports")
+target_compile_definitions(mxl-reader PRIVATE MXL_READER_VERSION="${MXL_READER_VERSION}")
+
 if (NOT TARGET CLI11::CLI11)
     find_package(CLI11 CONFIG REQUIRED)
 endif ()
