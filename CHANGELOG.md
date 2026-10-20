@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.0.0-rc.4](https://github.com/marquies/dmf-mf-mxl-reader/compare/v1.0.0-rc.3...v1.0.0-rc.4) (2026-10-20)
+
+
+### Features
+
+* show the ring's size and draw a grain into every slot ([0f6c432](https://github.com/marquies/dmf-mf-mxl-reader/commit/0f6c432d62820940905442233af26f4c0cfe4e1d))
+* show the ring's slots, slot size and total size ([69a7002](https://github.com/marquies/dmf-mf-mxl-reader/commit/69a7002c7edec2ee2fc2e428efd0de3b77fb8894))
+
+
+### Bug Fixes
+
+* draw a grain into every slot of the ring view ([dbdfe5f](https://github.com/marquies/dmf-mf-mxl-reader/commit/dbdfe5f821b196314dc5e6a352ad95a6d7524939))
+
 ## [1.0.0-rc.3](https://github.com/marquies/dmf-mf-mxl-reader/compare/v1.0.0-rc.2...v1.0.0-rc.3) (2026-10-20)
 
 
