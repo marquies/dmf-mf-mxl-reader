@@ -101,8 +101,8 @@ names a flow not read, or a key the reader does not check, exits with status 2; 
 docker build -t dmf-mf-mxl-reader:dev .
 ```
 
-The build runs `mxl-reader-tests`, the checks in `src/checks.hpp`, and fails
-with them.
+The build runs `mxl-reader-tests`, the checks in `src/checks.hpp` and the
+request handling in `src/http.hpp`, and fails with them.
 
 `GO_MXL_TAG` and `MXL_REF` move together with `dmf-mf-mxl-writer`'s, so the
 reader links the libmxl the writer and the mxl-k8s gateway run.
