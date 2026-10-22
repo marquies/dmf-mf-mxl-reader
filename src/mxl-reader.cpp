@@ -44,6 +44,7 @@
 #include <picojson/wrapper.h>
 
 #include "checks.hpp"
+#include "http.hpp"
 #include "page.hpp"
 
 namespace
@@ -869,6 +870,13 @@ namespace
         return out + "]}";
     }
 
+    // Short, so one client that sends nothing or reads slowly cannot hold a
+    // probe past its own timeout: requests are answered one at a time, and
+    // reading and answering each get this long.
+    constexpr auto RequestBudget = std::chrono::milliseconds{200};
+    // A viewer that takes longer than this to take one batch is dropped.
+    constexpr auto StreamSendBudget = std::chrono::seconds{2};
+
     std::atomic<int> streams{0};
     // Each open ring view costs a thread and a batch every 50 ms.
     constexpr int MaxStreams = 8;
@@ -880,7 +888,7 @@ namespace
     {
         auto const header = std::string{"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
                                         "Connection: keep-alive\r\nX-Accel-Buffering: no\r\n\r\n"};
-        auto sent = ::send(client, header.data(), header.size(), MSG_NOSIGNAL) > 0;
+        auto sent = reader::sendAll(client, header, StreamSendBudget);
         auto cursors = std::vector<std::uint64_t>(flows.size(), 0);
         auto const since = mxlGetTime() - 5 * NsPerSecond;
         for (std::size_t i = 0; i < flows.size(); ++i)
@@ -897,7 +905,7 @@ namespace
         while (sent && !stopping)
         {
             auto const message = "data: " + streamBatch(flows, cursors) + "\n\n";
-            sent = ::send(client, message.data(), message.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(message.size());
+            sent = reader::sendAll(client, message, StreamSendBudget);
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
         ::close(client);
@@ -938,15 +946,8 @@ namespace
             {
                 continue;
             }
-            // Short, so one client that sends nothing cannot hold a probe past
-            // its own timeout: requests are answered one at a time.
-            auto const clientTv = timeval{.tv_sec = 0, .tv_usec = 200'000};
-            ::setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &clientTv, sizeof(clientTv));
-            ::setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &clientTv, sizeof(clientTv));
-            char request[1024] = {};
-            auto const n = ::recv(client, request, sizeof(request) - 1, 0);
             // The request target alone, without a query: "GET <path> HTTP/1.1".
-            auto line = std::string{n > 0 ? request : ""};
+            auto line = reader::readRequest(client, RequestBudget);
             line = line.substr(0, line.find_first_of("\r\n"));
             auto const target = line.starts_with("GET ") ? line.substr(4, line.find(' ', 4) - 4) : std::string{};
             auto const path = target.substr(0, target.find('?'));
@@ -955,8 +956,6 @@ namespace
             {
                 if (streams.fetch_add(1) < MaxStreams)
                 {
-                    auto const streamTv = timeval{.tv_sec = 2, .tv_usec = 0};
-                    ::setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &streamTv, sizeof(streamTv));
                     std::thread{streamClient, client, std::cref(flows)}.detach();
                     continue;
                 }
@@ -1007,7 +1006,7 @@ namespace
             auto const response = fmt::format("HTTP/1.1 {} {}\r\nContent-Type: {}\r\n"
                                               "Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                 code, code == 200 ? "OK" : code == 503 ? "Service Unavailable" : "Not Found", type, body.size(), body);
-            ::send(client, response.data(), response.size(), MSG_NOSIGNAL);
+            reader::sendAll(client, response, RequestBudget);
             ::close(client);
         }
         ::close(fd);
