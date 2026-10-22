@@ -20,8 +20,14 @@ release.
 ## Usage
 
 ```
-mxl-reader -d <domain> -f <flow-id> [-f <flow-id> ...] [--expect <json>] [-p 9102] [--report-interval 10]
+mxl-reader -d <domain> -f <flow> [-f <flow> ...] [--expect <json>] [-p 9102] [--report-interval 10]
+           [--nmos-seed <seed> [--nmos-registry http://<host>[:<port>]] [--nmos-host <host>] [--nmos-label <label>]]
 ```
+
+A `<flow>` is a flow id, or a named slot `<name>:<video|audio|data>[=<flow id>]`
+that an NMOS controller can move to other flows (see NMOS below). Counters,
+`--expect` and `/status` key a slot by its flow id, or by `<name>:<kind>` for a
+named slot, so one name can hold a video, an audio and a data slot.
 
 The first line on stderr names the reader's version and the libmxl it runs
 against; `--version` prints the same and exits.
@@ -92,8 +98,36 @@ failed: `domain` unavailable, flow `not_found`, `permission` denied, or
 opened. `mxl_reader_stalls_total`, `mxl_reader_opens_total`,
 `mxl_reader_lost_total` and `mxl_reader_age_seconds` complete the set.
 
+## NMOS
+
+With `--nmos-seed` the reader is an NMOS Node (IS-04 v1.3, IS-05 v1.1) as AMWA
+BCP-007-03 specifies for MXL, served on the same port as the other endpoints.
+Every `-f` is then a named slot, and each slot is an MXL Receiver whose format
+follows its kind and whose BCP-004-01 capabilities follow its `--expect`
+(geometry, rate, sample rate, channels). Receivers are grouped by the
+`urn:x-nmos:tag:grouphint/v1.0` tag `<name>:Video`, `<name>:Audio` or
+`<name>:Data`.
+
+A controller connects a slot through the Connection API with a single leg of
+`mxl_domain_id` and `mxl_flow_id`. `auto` for the domain resolves to the id in
+`<domain>/domain_def.json`; another domain is refused, and `mxl_flow_id` takes
+no `auto`. An immediate activation moves the slot's reader to the flow named,
+and `master_enable` false moves it off; a flow that is not there yet is waited
+for, as at start. Scheduled activations answer 501. A slot booked without a
+flow reads nothing and does not count against `/delivering` until connected.
+
+Resource ids derive from the seed, so they survive restarts. With
+`--nmos-registry` the node registers with that IS-04 Registration API, sends a
+heartbeat every five seconds, registers again when the registry has dropped
+it, and posts a receiver again when its subscription changes. The node is
+advertised at `--nmos-host` (default: the hostname) and `-p`.
+
+The NMOS APIs are unauthenticated, as IS-04 and IS-05 are: whoever reaches the
+port can move a slot to any flow in the domain.
+
 An id that is not a lowercase flow UUID, or an `--expect` that is unreadable,
-names a flow not read, or a key the reader does not check, exits with status 2; a port that cannot be bound exits with status 1.
+names a flow not read, or a key the reader does not check, exits with status 2, as does a
+slot without a flow, a flow read twice, or an unnamed flow beside `--nmos-seed`; a port that cannot be bound exits with status 1.
 
 ## Build locally
 
@@ -102,7 +136,8 @@ docker build -t dmf-mf-mxl-reader:dev .
 ```
 
 The build runs `mxl-reader-tests`, the checks in `src/checks.hpp` and the
-request handling in `src/http.hpp`, and fails with them.
+request handling in `src/http.hpp`, and `mxl-reader-nmos-tests`, the NMOS Node
+in `src/nmos.hpp`, and fails with them.
 
 `GO_MXL_TAG` and `MXL_REF` move together with `dmf-mf-mxl-writer`'s, so the
 reader links the libmxl the writer and the mxl-k8s gateway run.

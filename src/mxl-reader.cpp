@@ -7,7 +7,11 @@
 // overtaken, unreadable, or there but wrong - and counted, so a load or failure
 // test sees exactly which way a flow went bad. The counts are served as
 // Prometheus text on /metrics and as JSON on /status; /delivering answers 200
-// only while every flow delivers.
+// only while every connected flow delivers.
+//
+// With --nmos-seed the reader is also an NMOS Node (AMWA IS-04, IS-05 and
+// BCP-007-03): each named reader slot is an MXL Receiver a controller connects
+// to a flow, and a connection moves that slot's reader to the flow named.
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -45,6 +49,7 @@
 
 #include "checks.hpp"
 #include "http.hpp"
+#include "nmos.hpp"
 #include "page.hpp"
 
 namespace
@@ -87,6 +92,8 @@ namespace
         PermissionDenied,
         FlowError,
         Open,
+        // A named slot no flow is connected to: it reads nothing on purpose.
+        Disconnected,
     };
 
     char const* stateName(State state)
@@ -99,6 +106,7 @@ namespace
             case State::PermissionDenied:  return "permission_denied";
             case State::FlowError:         return "flow_error";
             case State::Open:              return "open";
+            case State::Disconnected:      return "disconnected";
         }
         return "unknown";
     }
@@ -130,8 +138,17 @@ namespace
 
     struct FlowStats
     {
+        // What the slot is keyed by: its flow id, or its name for a named
+        // slot, which keeps it whichever flow it reads.
         std::string id;
         std::optional<Expectation> expected;
+
+        // The flow the slot reads; empty reads nothing. An NMOS controller
+        // can change it while the slot runs: written under mutex, and every
+        // change counts up generation, which ends the read loop of the flow
+        // before.
+        std::string target;
+        std::atomic<std::uint64_t> generation{0};
 
         std::atomic<State> state{State::Starting};
         std::atomic<bool> continuous{false};
@@ -209,6 +226,62 @@ namespace
             lastErrorAt = mxlGetTime();
         }
     };
+
+    std::pair<std::string, std::uint64_t> targetOf(FlowStats& stats)
+    {
+        auto const lock = std::lock_guard{stats.mutex};
+        return {stats.target, stats.generation.load()};
+    }
+
+    // Forgets what was read from the flow before: the counters stay, the
+    // description and the ring view start over. Called with mutex held.
+    void forgetFlow(FlowStats& stats)
+    {
+        stats.mediaType.clear();
+        stats.format.clear();
+        stats.formatMismatch.clear();
+        stats.lastError.clear();
+        stats.lastErrorAt = 0;
+        stats.events.clear();
+        stats.lastReadAt = 0;
+        stats.ageNs = 0;
+        stats.ringLength = 0;
+        stats.slotBytes = 0;
+        stats.readerIndex = 0;
+        stats.headSeen = 0;
+    }
+
+    // Moves a slot to another flow, or off its flow for an empty id.
+    void retarget(FlowStats& stats, std::string const& flow)
+    {
+        auto const lock = std::lock_guard{stats.mutex};
+        if (stats.target != flow)
+        {
+            stats.target = flow;
+            ++stats.generation;
+            forgetFlow(stats);
+        }
+    }
+
+    // The reader thread forgets the flow it leaves as well, once it has
+    // stopped reading it.
+    void leaveFlow(FlowStats& stats)
+    {
+        auto const lock = std::lock_guard{stats.mutex};
+        forgetFlow(stats);
+    }
+
+    // Sleeps up to ns, but wakes as soon as the slot is moved to another flow,
+    // so a retry interval never delays a connection.
+    void pause(FlowStats const& stats, std::uint64_t generation, std::uint64_t ns)
+    {
+        while (ns > 0 && !stopping && stats.generation == generation)
+        {
+            auto const step = std::min<std::uint64_t>(ns, NsPerSecond / 20);
+            mxlSleepForNs(step);
+            ns -= step;
+        }
+    }
 
     std::uint64_t periodNs(mxlRational const& rate)
     {
@@ -372,7 +445,7 @@ namespace
     // Returns the status that ended the loop: anything other than a read that
     // is merely early or late means the reader no longer holds a usable flow.
     mxlStatus readDiscrete(mxlFlowReader reader, mxlFlowConfigInfo const& config, Declared const& declared, bool wrongFormat,
-        FlowStats& stats)
+        FlowStats& stats, std::uint64_t generation)
     {
         auto const& rate = config.common.grainRate;
         // Several grain periods, so a writer that commits a grain late is a
@@ -402,7 +475,7 @@ namespace
             markRead(stats, rate, index);
             ++index;
         };
-        while (!stopping)
+        while (!stopping && stats.generation == generation)
         {
             auto grain = mxlGrainInfo{};
             std::uint8_t* payload = nullptr;
@@ -462,7 +535,7 @@ namespace
     }
 
     mxlStatus readContinuous(mxlFlowReader reader, mxlFlowConfigInfo const& config, Declared const& declared,
-        bool wrongFormat, FlowStats& stats)
+        bool wrongFormat, FlowStats& stats, std::uint64_t generation)
     {
         auto const& rate = config.common.grainRate;
         // Ten milliseconds of samples, or the writer's own signalling batch when
@@ -481,7 +554,7 @@ namespace
         auto const float32 = declared.mediaType == "audio/float32" && stats.expected && stats.expected->checkLegal;
         auto index = headIndex(reader, mxlGetCurrentIndex(&rate));
         auto earlyCounted = std::uint64_t{0};
-        while (!stopping)
+        while (!stopping && stats.generation == generation)
         {
             auto const next = index + batch;
             auto slices = mxlWrappedMultiBufferSlice{};
@@ -551,8 +624,24 @@ namespace
     void readFlow(std::string const& domain, FlowStats& stats)
     {
         mxlInstance instance = nullptr;
+        auto seen = stats.generation.load();
         while (!stopping)
         {
+            auto const [flow, generation] = targetOf(stats);
+            if (generation != seen)
+            {
+                // Whatever this thread recorded of the flow it left, after
+                // retarget() cleared it, goes too: a read or an error that was
+                // under way when the slot moved.
+                leaveFlow(stats);
+                seen = generation;
+            }
+            if (flow.empty())
+            {
+                stats.state = State::Disconnected;
+                pause(stats, generation, NsPerSecond);
+                continue;
+            }
             if (instance == nullptr)
             {
                 instance = mxlCreateInstance(domain.c_str(), "");
@@ -565,13 +654,13 @@ namespace
                     struct stat st{};
                     stats.error(::stat(domain.c_str(), &st) == 0 ? fmt::format("cannot open MXL domain {}", domain)
                                                                   : fmt::format("MXL domain {} does not exist", domain));
-                    mxlSleepForNs(NsPerSecond);
+                    pause(stats, generation, NsPerSecond);
                     continue;
                 }
             }
 
             mxlFlowReader reader = nullptr;
-            auto status = mxlCreateFlowReader(instance, stats.id.c_str(), "", &reader);
+            auto status = mxlCreateFlowReader(instance, flow.c_str(), "", &reader);
             if (status != MXL_STATUS_OK)
             {
                 // Not there yet: the flow is still being mirrored here, or its
@@ -581,27 +670,27 @@ namespace
                 {
                     ++stats.flowNotFound;
                     stats.state = State::FlowNotFound;
-                    stats.error("flow not found in the domain");
+                    stats.error("flow " + flow + " not found in the domain");
                 }
-                else if (status == MXL_ERR_PERMISSION_DENIED || permissionDenied(domain, stats.id))
+                else if (status == MXL_ERR_PERMISSION_DENIED || permissionDenied(domain, flow))
                 {
                     ++stats.flowPermission;
                     stats.state = State::PermissionDenied;
-                    stats.error("permission denied opening the flow");
+                    stats.error("permission denied opening flow " + flow);
                 }
                 else
                 {
                     ++stats.flowOther;
                     stats.state = State::FlowError;
-                    stats.error(fmt::format("cannot open the flow: status {}", static_cast<int>(status)));
+                    stats.error(fmt::format("cannot open flow {}: status {}", flow, static_cast<int>(status)));
                 }
-                mxlSleepForNs(NsPerSecond);
+                pause(stats, generation, NsPerSecond);
                 continue;
             }
 
             auto info = mxlFlowInfo{};
             status = mxlFlowReaderGetInfo(reader, &info);
-            auto const definition = status == MXL_STATUS_OK ? readDefinition(instance, stats.id) : std::nullopt;
+            auto const definition = status == MXL_STATUS_OK ? readDefinition(instance, flow) : std::nullopt;
             if (!definition)
             {
                 // Opened but not described: nothing can be checked against an
@@ -609,9 +698,15 @@ namespace
                 mxlReleaseFlowReader(instance, reader);
                 ++stats.flowOther;
                 stats.state = State::FlowError;
-                stats.error(status == MXL_STATUS_OK ? std::string{"cannot read the flow definition"}
-                                                    : fmt::format("cannot read the flow info: status {}", static_cast<int>(status)));
-                mxlSleepForNs(NsPerSecond);
+                stats.error(status == MXL_STATUS_OK ? "cannot read the definition of flow " + flow
+                                                    : fmt::format("cannot read the info of flow {}: status {}", flow, static_cast<int>(status)));
+                pause(stats, generation, NsPerSecond);
+                continue;
+            }
+            if (stats.generation != generation)
+            {
+                // Moved while opening: describe nothing of the flow left.
+                mxlReleaseFlowReader(instance, reader);
                 continue;
             }
             {
@@ -633,36 +728,42 @@ namespace
                 stats.continuous = info.config.common.format == MXL_DATA_FORMAT_AUDIO;
                 stats.lastProgressAt = mxlGetTime();
                 stats.state = State::Open;
-                std::fprintf(stderr, "flow %s: open, %s %s\n", stats.id.c_str(), declared.mediaType.c_str(),
+                std::fprintf(stderr, "flow %s: open %s, %s %s\n", stats.id.c_str(), flow.c_str(), declared.mediaType.c_str(),
                     stats.continuous ? "continuous" : "discrete");
-                status = stats.continuous ? readContinuous(reader, info.config, declared, !wrong.empty(), stats)
-                                          : readDiscrete(reader, info.config, declared, !wrong.empty(), stats);
+                status = stats.continuous ? readContinuous(reader, info.config, declared, !wrong.empty(), stats, generation)
+                                          : readDiscrete(reader, info.config, declared, !wrong.empty(), stats, generation);
             }
             mxlReleaseFlowReader(instance, reader);
             if (stopping)
             {
                 break;
             }
+            if (stats.generation != generation)
+            {
+                // Moved to another flow: not a failure of this one.
+                std::fprintf(stderr, "flow %s: leaving %s for another flow\n", stats.id.c_str(), flow.c_str());
+                continue;
+            }
             if (status == MXL_ERR_PERMISSION_DENIED)
             {
                 ++stats.readPermission;
                 stats.state = State::PermissionDenied;
-                stats.error("permission denied reading the flow");
+                stats.error("permission denied reading flow " + flow);
             }
             else if (status == MXL_ERR_FLOW_INVALID || status == MXL_ERR_INVALID_FLOW_READER || status == MXL_ERR_FLOW_NOT_FOUND)
             {
                 // Its writer went away or replaced the flow: open it again.
                 ++stats.lost;
                 stats.state = State::FlowNotFound;
-                stats.error("flow went away, reopening");
+                stats.error("flow " + flow + " went away, reopening");
             }
             else
             {
                 ++stats.readOther;
                 stats.state = State::FlowError;
-                stats.error(fmt::format("read failed: status {}, reopening", static_cast<int>(status)));
+                stats.error(fmt::format("reading flow {} failed: status {}, reopening", flow, static_cast<int>(status)));
             }
-            mxlSleepForNs(NsPerSecond);
+            pause(stats, generation, NsPerSecond);
         }
         if (instance != nullptr)
         {
@@ -734,9 +835,9 @@ namespace
                "# TYPE mxl_reader_flow_info gauge\n";
         for (auto const& flow : flows)
         {
-            if (flow->opens > 0)
+            auto const lock = std::lock_guard{flow->mutex};
+            if (flow->opens > 0 && !flow->mediaType.empty())
             {
-                auto const lock = std::lock_guard{flow->mutex};
                 out += fmt::format("mxl_reader_flow_info{{flow=\"{}\",media_type=\"{}\",unit=\"{}\"}} 1\n", flow->id,
                     reader::labelValue(flow->mediaType), flow->continuous ? "samples" : "grains");
             }
@@ -803,9 +904,9 @@ namespace
             auto const& flow = *flows[i];
             auto const lock = std::lock_guard{flow.mutex};
             out += i ? "," : "";
-            out += fmt::format("{{\"id\":{},\"state\":\"{}\",\"delivering\":{},\"unit\":{},\"mediaType\":{},"
+            out += fmt::format("{{\"id\":{},\"flowId\":{},\"state\":\"{}\",\"delivering\":{},\"unit\":{},\"mediaType\":{},"
                                "\"format\":{},\"formatMismatch\":{},\"ageSeconds\":{},",
-                jsonString(flow.id), stateName(flow.state), delivering(flow) ? "true" : "false",
+                jsonString(flow.id), jsonString(flow.target), stateName(flow.state), delivering(flow) ? "true" : "false",
                 flow.opens == 0 ? "null" : flow.continuous ? "\"samples\"" : "\"grains\"", jsonString(flow.mediaType),
                 jsonString(flow.format),
                 jsonString(flow.formatMismatch),
@@ -912,7 +1013,21 @@ namespace
         --streams;
     }
 
-    void serve(int port, std::vector<std::unique_ptr<FlowStats>> const& flows)
+    char const* reason(int code)
+    {
+        switch (code)
+        {
+            case 200: return "OK";
+            case 400: return "Bad Request";
+            case 404: return "Not Found";
+            case 405: return "Method Not Allowed";
+            case 501: return "Not Implemented";
+            case 503: return "Service Unavailable";
+        }
+        return "Internal Server Error";
+    }
+
+    void serve(int port, std::vector<std::unique_ptr<FlowStats>> const& flows, reader::nmos::Node* node)
     {
         auto const fd = ::socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0)
@@ -946,11 +1061,19 @@ namespace
             {
                 continue;
             }
-            // The request target alone, without a query: "GET <path> HTTP/1.1".
-            auto line = reader::readRequest(client, RequestBudget);
-            line = line.substr(0, line.find_first_of("\r\n"));
-            auto const target = line.starts_with("GET ") ? line.substr(4, line.find(' ', 4) - 4) : std::string{};
-            auto const path = target.substr(0, target.find('?'));
+            auto const request = reader::parseRequest(reader::readRequest(client, RequestBudget));
+            // The NMOS APIs take GET and PATCH; everything else here is read.
+            if (node != nullptr && request.path.starts_with("/x-nmos/"))
+            {
+                auto const reply = node->handle(request.method, request.path, request.body);
+                auto const response = fmt::format("HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n"
+                                                  "Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    reply.code, reason(reply.code), reply.body.size(), reply.body);
+                reader::sendAll(client, response, RequestBudget);
+                ::close(client);
+                continue;
+            }
+            auto const path = request.method == "GET" ? request.path : std::string{};
 
             if (path == "/stream")
             {
@@ -986,10 +1109,11 @@ namespace
             }
             else if (path == "/delivering")
             {
+                // A slot no flow is connected to reads nothing on purpose.
                 auto all = true;
                 for (auto const& flow : flows)
                 {
-                    all = all && delivering(*flow);
+                    all = all && (flow->state == State::Disconnected || delivering(*flow));
                 }
                 code = all ? 200 : 503;
                 body = all ? "delivering\n" : "not every flow is delivering\n";
@@ -1005,11 +1129,114 @@ namespace
             }
             auto const response = fmt::format("HTTP/1.1 {} {}\r\nContent-Type: {}\r\n"
                                               "Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                code, code == 200 ? "OK" : code == 503 ? "Service Unavailable" : "Not Found", type, body.size(), body);
+                code, reason(code), type, body.size(), body);
             reader::sendAll(client, response, RequestBudget);
             ::close(client);
         }
         ::close(fd);
+    }
+
+
+    // The id of the MXL domain, from the domain_def.json BCP-007-03 has every
+    // domain carry; empty when it cannot be read.
+    std::string domainId(std::string const& domain)
+    {
+        auto* file = std::fopen((domain + "/domain_def.json").c_str(), "r");
+        if (file == nullptr)
+        {
+            return {};
+        }
+        auto text = std::string{};
+        char buffer[4096];
+        while (auto const n = std::fread(buffer, 1, sizeof(buffer), file))
+        {
+            text.append(buffer, n);
+        }
+        std::fclose(file);
+        auto json = picojson::value{};
+        if (!picojson::parse(json, text).empty() || !json.is<picojson::object>() || !json.get("id").is<std::string>())
+        {
+            return {};
+        }
+        return json.get("id").get<std::string>();
+    }
+
+    // Registers the node with an IS-04 Registration API and keeps it
+    // registered: a heartbeat every five seconds, registration again when
+    // the registry has dropped the node, and a receiver posted again when its
+    // subscription changes.
+    void registerNode(reader::nmos::Node& node, std::string const& host, int port)
+    {
+        constexpr auto Budget = std::chrono::seconds{5};
+        constexpr auto Resource = "/x-nmos/registration/v1.3/resource";
+        auto const post = [&](std::string const& type, std::string const& data) {
+            auto const r = reader::request(host, port, "POST", Resource, fmt::format("{{\"type\":\"{}\",\"data\":{}}}", type, data), Budget);
+            if (r.code != 200 && r.code != 201)
+            {
+                std::fprintf(stderr, "nmos: registering a %s failed: %d %s\n", type.c_str(), r.code, r.body.substr(0, 300).c_str());
+                return false;
+            }
+            return true;
+        };
+        auto registered = false;
+        while (!stopping)
+        {
+            // A fixed period, whatever the requests took, so a slow registry
+            // does not stretch the heartbeat towards its expiry.
+            auto const due = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+            if (!registered)
+            {
+                node.takeChanged();
+                registered = true;
+                for (auto const& [type, data] : node.resources())
+                {
+                    if (!post(type, data))
+                    {
+                        registered = false;
+                        break;
+                    }
+                }
+                if (registered)
+                {
+                    std::fprintf(stderr, "nmos: node %s registered with %s:%d\n", node.nodeId().c_str(), host.c_str(), port);
+                }
+            }
+            else
+            {
+                // A receiver update the registry missed is sent again with a
+                // full registration, or the registry keeps the old state.
+                for (auto const& data : node.takeChanged())
+                {
+                    if (!post("receiver", data))
+                    {
+                        registered = false;
+                    }
+                }
+                if (!registered)
+                {
+                    continue;
+                }
+                auto const r = reader::request(host, port, "POST", "/x-nmos/registration/v1.3/health/nodes/" + node.nodeId(), "", Budget);
+                if (r.code == 404)
+                {
+                    std::fprintf(stderr, "nmos: the registry dropped the node, registering again\n");
+                    registered = false;
+                    continue;
+                }
+                if (r.code != 200)
+                {
+                    std::fprintf(stderr, "nmos: heartbeat failed: %d\n", r.code);
+                }
+            }
+            while (!stopping && std::chrono::steady_clock::now() < due)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds{100});
+            }
+        }
+        if (registered)
+        {
+            reader::request(host, port, "DELETE", std::string{Resource} + "/nodes/" + node.nodeId(), "", std::chrono::seconds{2});
+        }
     }
 
 }
@@ -1020,49 +1247,150 @@ int main(int argc, char** argv)
     app.set_version_flag("--version", versionText());
     auto domain = std::string{};
     app.add_option("-d,--domain", domain, "The MXL domain directory.")->required();
-    auto flowIds = std::vector<std::string>{};
-    app.add_option("-f,--flow", flowIds, "A flow id to read. Repeat for several.")->required();
+    auto flowSpecs = std::vector<std::string>{};
+    app.add_option("-f,--flow", flowSpecs,
+           "A flow id to read, or a named slot <name>:<video|audio|data>[=<flow id>] an NMOS controller can connect. "
+           "Repeat for several.")
+        ->required();
     auto expect = std::string{};
-    app.add_option("--expect", expect, "JSON object of what each flow should carry, keyed by flow id.");
+    app.add_option("--expect", expect, "JSON object of what each flow should carry, keyed by flow id or slot name.");
     auto port = 9102;
-    app.add_option("-p,--port", port, "Port of the metrics and status endpoints.");
+    app.add_option("-p,--port", port, "Port of the metrics, status and NMOS endpoints.");
     auto reportSeconds = 10;
     app.add_option("--report-interval", reportSeconds, "Seconds between summary lines on stderr. 0 disables them.");
+    auto nmosSeed = std::string{};
+    app.add_option("--nmos-seed", nmosSeed,
+        "Serve an NMOS Node whose named slots are MXL Receivers, with resource ids derived from this seed. "
+        "Keep it across restarts.");
+    auto nmosRegistry = std::string{};
+    app.add_option("--nmos-registry", nmosRegistry, "IS-04 registry to register the node with, as http://<host>[:<port>].");
+    auto nmosHost = std::string{};
+    app.add_option("--nmos-host", nmosHost, "Host the registry and controllers reach this node at. Empty: the hostname.");
+    auto nmosLabel = std::string{"mxl-reader"};
+    app.add_option("--nmos-label", nmosLabel, "Label of the NMOS node and device.");
     CLI11_PARSE(app, argc, argv);
 
     // libmxl answers a malformed id as an invalid argument, which the read loop
     // would take for a flow not there yet and wait on for ever.
-    auto const uuid = std::regex{"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"};
-    for (auto const& id : flowIds)
+    auto slots = std::vector<reader::nmos::Slot>{};
+    auto keys = std::vector<std::string>{};
+    for (auto const& spec : flowSpecs)
     {
-        if (!std::regex_match(id, uuid))
+        auto slot = reader::nmos::Slot{};
+        if (auto const err = reader::nmos::parseSlot(spec, slot); !err.empty())
         {
-            std::fprintf(stderr, "not a lowercase flow UUID: %s\n", id.c_str());
+            std::fprintf(stderr, "%s\n", err.c_str());
             return 2;
+        }
+        if (std::find(keys.begin(), keys.end(), slot.key) != keys.end())
+        {
+            std::fprintf(stderr, "read twice: %s\n", slot.key.c_str());
+            return 2;
+        }
+        // Only a controller connects a slot booked without a flow, and only
+        // a slot with a kind can be a Receiver.
+        if (slot.name.empty() && !nmosSeed.empty())
+        {
+            std::fprintf(stderr, "with --nmos-seed every flow is a named slot <name>:<kind>[=<flow id>]: %s\n", spec.c_str());
+            return 2;
+        }
+        if (slot.flow.empty() && nmosSeed.empty())
+        {
+            std::fprintf(stderr, "slot %s has no flow and no NMOS controller can connect one without --nmos-seed\n", slot.key.c_str());
+            return 2;
+        }
+        keys.push_back(slot.key);
+        slots.push_back(std::move(slot));
+    }
+    auto registryHost = std::string{};
+    auto registryPort = 80;
+    if (!nmosRegistry.empty())
+    {
+        static auto const re = std::regex{"^http://([^/:]+)(:([0-9]{1,5}))?/?$"};
+        auto m = std::smatch{};
+        if (nmosSeed.empty() || !std::regex_match(nmosRegistry, m, re))
+        {
+            std::fprintf(stderr, "--nmos-registry takes http://<host>[:<port>] and needs --nmos-seed\n");
+            return 2;
+        }
+        registryHost = m[1].str();
+        if (m[3].matched)
+        {
+            registryPort = std::stoi(m[3].str());
+            if (registryPort < 1 || registryPort > 65535)
+            {
+                std::fprintf(stderr, "--nmos-registry port out of range: %d\n", registryPort);
+                return 2;
+            }
         }
     }
     auto expectations = std::map<std::string, Expectation>{};
-    if (auto const err = reader::parseExpectations(expect, flowIds, expectations); !err.empty())
+    if (auto const err = reader::parseExpectations(expect, keys, expectations); !err.empty())
     {
         std::fprintf(stderr, "%s\n", err.c_str());
         return 2;
+    }
+    for (auto const& [key, e] : expectations)
+    {
+        if (!e.rate.empty() && !reader::nmos::parseRate(e.rate))
+        {
+            std::fprintf(stderr, "--expect: the rate of %s must be <numerator>/<denominator>: %s\n", key.c_str(), e.rate.c_str());
+            return 2;
+        }
     }
 
     std::signal(SIGTERM, onSignal);
     std::signal(SIGINT, onSignal);
 
-    std::fprintf(stderr, "%s, reading %zu flow%s from %s, serving on :%d\n", versionText().c_str(), flowIds.size(),
-        flowIds.size() == 1 ? "" : "s", domain.c_str(), port);
+    std::fprintf(stderr, "%s, reading %zu flow%s from %s, serving on :%d\n", versionText().c_str(), slots.size(),
+        slots.size() == 1 ? "" : "s", domain.c_str(), port);
 
     auto flows = std::vector<std::unique_ptr<FlowStats>>{};
-    for (auto const& id : flowIds)
+    for (auto const& slot : slots)
     {
         flows.push_back(std::make_unique<FlowStats>());
-        flows.back()->id = id;
-        if (auto const it = expectations.find(id); it != expectations.end())
+        flows.back()->id = slot.key;
+        flows.back()->target = slot.flow;
+        if (auto const it = expectations.find(slot.key); it != expectations.end())
         {
             flows.back()->expected = it->second;
         }
+    }
+
+    auto node = std::unique_ptr<reader::nmos::Node>{};
+    if (!nmosSeed.empty())
+    {
+        if (nmosHost.empty())
+        {
+            char name[256] = {};
+            ::gethostname(name, sizeof(name) - 1);
+            nmosHost = name;
+        }
+        auto const domainIdValue = domainId(domain);
+        if (domainIdValue.empty())
+        {
+            std::fprintf(stderr, "nmos: %s/domain_def.json names no domain id; a connection that names a domain is refused\n",
+                domain.c_str());
+        }
+        node = std::make_unique<reader::nmos::Node>(
+            reader::nmos::NodeConfig{.seed = nmosSeed, .label = nmosLabel, .description = "mxl-reader", .host = nmosHost,
+                .port = port, .domainId = domainIdValue},
+            [&flows](std::size_t slot, std::string const& flow) {
+                retarget(*flows.at(slot), flow);
+                return std::string{};
+            });
+        for (std::size_t i = 0; i < slots.size(); ++i)
+        {
+            auto constraints = std::optional<reader::nmos::Constraints>{};
+            if (auto const& e = flows[i]->expected)
+            {
+                constraints = reader::nmos::Constraints{.width = e->width, .height = e->height, .rate = e->rate,
+                    .sampleRate = e->sampleRate, .channels = e->channels};
+            }
+            node->addReceiver(slots[i].name, slots[i].kind, constraints, slots[i].flow);
+        }
+        std::fprintf(stderr, "nmos: node %s with %zu receiver%s at %s:%d\n", node->nodeId().c_str(), slots.size(),
+            slots.size() == 1 ? "" : "s", nmosHost.c_str(), port);
     }
 
     auto threads = std::vector<std::thread>{};
@@ -1070,7 +1398,11 @@ int main(int argc, char** argv)
     {
         threads.emplace_back(readFlow, domain, std::ref(*flow));
     }
-    threads.emplace_back(serve, port, std::cref(flows));
+    threads.emplace_back(serve, port, std::cref(flows), node.get());
+    if (node && !registryHost.empty())
+    {
+        threads.emplace_back(registerNode, std::ref(*node), registryHost, registryPort);
+    }
 
     auto previous = std::vector<std::uint64_t>(flows.size(), 0);
     auto waited = 0;
