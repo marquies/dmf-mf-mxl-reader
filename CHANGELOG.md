@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.0-rc.5](https://github.com/marquies/dmf-mf-mxl-reader/compare/v1.0.0-rc.4...v1.0.0-rc.5) (2026-10-22)
+
+
+### Bug Fixes
+
+* read a whole request before answering it ([72ed0fc](https://github.com/marquies/dmf-mf-mxl-reader/commit/72ed0fce793b40abffaaac18413ee77de38296ca))
+* read a whole request before answering it ([52d96fd](https://github.com/marquies/dmf-mf-mxl-reader/commit/52d96fd6b03ad0f3aac89da9724f0bb47f9e5246))
+
 ## [1.0.0-rc.4](https://github.com/marquies/dmf-mf-mxl-reader/compare/v1.0.0-rc.3...v1.0.0-rc.4) (2026-10-20)
 
 
