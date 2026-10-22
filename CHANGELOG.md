@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.0-rc.6](https://github.com/marquies/dmf-mf-mxl-reader/compare/v1.0.0-rc.5...v1.0.0-rc.6) (2026-10-22)
+
+
+### Features
+
+* **nmos:** connect reader slots to flows over BCP-007-03 ([8d0471a](https://github.com/marquies/dmf-mf-mxl-reader/commit/8d0471a5fba680d5ed7f5d7cca0716110d13ff19))
+* **nmos:** connect reader slots to flows over BCP-007-03 ([44f196b](https://github.com/marquies/dmf-mf-mxl-reader/commit/44f196bf84c1b0f65d2b2f0f63e9aa03995a3d2b))
+
 ## [1.0.0-rc.5](https://github.com/marquies/dmf-mf-mxl-reader/compare/v1.0.0-rc.4...v1.0.0-rc.5) (2026-10-22)
 
 
