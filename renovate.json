@@ -28,7 +28,7 @@
       "customType": "regex",
       "description": "Dockerfile ARG MONITORING_REF",
       "managerFilePatterns": ["/^Dockerfile$/"],
-      "matchStrings": ["# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+ARG MONITORING_REF=(?<currentValue>\\S+)"]
+      "matchStrings": ["# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+ARG MONITORING_TAG=(?<currentValue>\\S+)\\s+ARG MONITORING_REF=(?<currentDigest>\\S+)"]
     }
   ]
 }

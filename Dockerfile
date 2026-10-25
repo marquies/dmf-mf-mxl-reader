@@ -13,9 +13,11 @@ ARG MXL_SRC=https://github.com/dmf-mxl/mxl.git
 ARG MXL_REF=4a8a50e7
 
 # libmxl-monitoring counts, checks and renders what the reader reads; built
-# into the same tree and linked statically.
+# into the same tree and linked statically. Checked out by commit, which a
+# moved tag cannot change; the tag names the release it is.
 # renovate: datasource=github-tags depName=marquies/libmxl-monitoring
-ARG MONITORING_REF=v0.2.0
+ARG MONITORING_TAG=v0.2.0
+ARG MONITORING_REF=c034ebf78a97a0d65e217021bff1ad693c9639c3
 
 FROM ghcr.io/qvest-digital/go-mxl-builder:${GO_MXL_TAG} AS build
 ARG MXL_REF
