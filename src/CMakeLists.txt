@@ -25,9 +25,13 @@ if (NOT TARGET picojson::picojson)
     find_package(picojson REQUIRED)
 endif ()
 
+# libmxl-monitoring, added to the same tree by the image build, counts and
+# checks every read and renders /metrics.
 target_link_libraries(mxl-reader
         PRIVATE
             mxl
+            mxl-monitoring
+            mxl-monitoring-prometheus
             CLI11::CLI11
             fmt::fmt
             picojson::picojson
@@ -44,6 +48,7 @@ target_sources(mxl-reader-tests PRIVATE checks-test.cpp)
 target_link_libraries(mxl-reader-tests
         PRIVATE
             mxl
+            mxl-monitoring
             fmt::fmt
             picojson::picojson
     )

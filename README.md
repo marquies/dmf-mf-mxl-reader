@@ -8,6 +8,9 @@ reading at the head shows whether that copy keeps up. The reader is built inside
 a [`dmf-mxl/mxl`](https://github.com/dmf-mxl/mxl) tree against the
 `ghcr.io/qvest-digital/go-mxl-runtime` libmxl, the same pair
 `dmf-mf-mxl-writer` builds against, so reader and writer share one libmxl ABI.
+What it counts and checks of each read, and the `/metrics` text, come from
+[`libmxl-monitoring`](https://github.com/marquies/libmxl-monitoring), built
+into the same tree and linked statically.
 
 ## Image
 
@@ -94,9 +97,12 @@ counted in grains for video and data and in samples for audio, except
 failed: `domain` unavailable, flow `not_found`, `permission` denied, or
 `other`. `mxl_reader_flow_state{state}` names where each flow stands
 (`starting`, `domain_unavailable`, `flow_not_found`, `permission_denied`,
-`flow_error`, `open`), and `mxl_reader_flow_info` its media type and unit once
-opened. `mxl_reader_stalls_total`, `mxl_reader_opens_total`,
-`mxl_reader_lost_total` and `mxl_reader_age_seconds` complete the set.
+`flow_error`, `open`, `disconnected`), and `mxl_reader_flow_info` its media
+type and unit once opened. `mxl_reader_stalls_total`, `mxl_reader_opens_total`,
+`mxl_reader_lost_total` and `mxl_reader_age_seconds` complete the set, with two
+histograms: `mxl_reader_arrival_seconds`, read time minus media timestamp, and
+`mxl_reader_commit_seconds`, commit time minus media timestamp for grains read
+while they are the head.
 
 ## NMOS
 
@@ -135,9 +141,11 @@ slot without a flow, a flow read twice, or an unnamed flow beside `--nmos-seed`;
 docker build -t dmf-mf-mxl-reader:dev .
 ```
 
-The build runs `mxl-reader-tests`, the checks in `src/checks.hpp` and the
-request handling in `src/http.hpp`, and `mxl-reader-nmos-tests`, the NMOS Node
-in `src/nmos.hpp`, and fails with them.
+The build runs `mxl-reader-tests`, the `--expect` handling in `src/checks.hpp`
+and the request handling in `src/http.hpp`, and `mxl-reader-nmos-tests`, the
+NMOS Node in `src/nmos.hpp`, and fails with them. The checks a grain or a
+batch of samples goes through are tested in libmxl-monitoring, which
+`MONITORING_REF` pins.
 
 `GO_MXL_TAG` and `MXL_REF` move together with `dmf-mf-mxl-writer`'s, so the
 reader links the libmxl the writer and the mxl-k8s gateway run.
