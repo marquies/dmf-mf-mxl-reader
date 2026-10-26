@@ -142,11 +142,26 @@ slot without a flow, a flow read twice, or an unnamed flow beside `--nmos-seed`;
 docker build -t dmf-mf-mxl-reader:dev .
 ```
 
-The build runs `mxl-reader-tests`, the `--expect` handling in `src/checks.hpp`
-and the request handling in `src/http.hpp`, and `mxl-reader-nmos-tests`, the
-NMOS Node in `src/nmos.hpp`, and fails with them. The checks a grain or a
+The build runs the unit tests in `tests/unittests`: `mxl-reader-tests`, the
+`--expect` handling in `src/checks.hpp` and the request handling in
+`src/http.hpp`, and `mxl-reader-nmos-tests`, the NMOS Node in `src/nmos.hpp`,
+and fails with them. The checks a grain or a
 batch of samples goes through are tested in libmxl-monitoring, which
 `MONITORING_REF` pins.
+
+It then runs `tests/integration/integration-test.py`: `mxl-pattern-writer`,
+built from the same directory, writes a video and an audio flow into a domain
+under `/dev/shm`, the reader reads them, and each test has the writer produce
+one fault and checks what `/status` counted: clean writing, grains flagged
+invalid, grains left part-written, reserved v210 codes, grains of the wrong
+size, a writer pausing within and beyond the ring, a frozen reader, a flow not
+there yet, a removed flow, a flow the reader may not open, and a flow declaring
+other than `--expect` states. A part-written grain and a writer's gap both read
+as `invalid`, since libmxl marks them so; `missing` and `incomplete` are left to
+the libmxl-monitoring tests. The permission test runs the reader as `nobody`
+and is skipped unless the suite runs as root, as it does in the image build.
+`permission_error` on a read is not covered: libmxl returns no permission status
+from a read.
 
 `GO_MXL_TAG` and `MXL_REF` move together with `dmf-mf-mxl-writer`'s, so the
 reader links the libmxl the writer and the mxl-k8s gateway run.

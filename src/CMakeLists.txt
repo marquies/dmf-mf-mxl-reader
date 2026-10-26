@@ -41,23 +41,3 @@ set_target_properties(mxl-reader
         PROPERTIES
             INSTALL_RPATH "${MXL_TOOLS_INSTALL_RPATH}"
     )
-
-add_executable(mxl-reader-tests)
-target_compile_features(mxl-reader-tests PRIVATE cxx_std_20)
-target_sources(mxl-reader-tests PRIVATE checks-test.cpp)
-target_link_libraries(mxl-reader-tests
-        PRIVATE
-            mxl
-            mxl-monitoring
-            fmt::fmt
-            picojson::picojson
-    )
-
-add_executable(mxl-reader-nmos-tests)
-target_compile_features(mxl-reader-nmos-tests PRIVATE cxx_std_20)
-target_sources(mxl-reader-nmos-tests PRIVATE nmos-test.cpp)
-target_link_libraries(mxl-reader-nmos-tests
-        PRIVATE
-            fmt::fmt
-            picojson::picojson
-    )
