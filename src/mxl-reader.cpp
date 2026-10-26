@@ -789,9 +789,9 @@ namespace
         {
             auto const& flow = *flows[i];
             auto const lock = std::lock_guard{flow.mutex};
-            out += fmt::format("{}{{\"id\":{},\"label\":{},\"unit\":\"{}\",\"state\":\"{}\",\"ring\":{},\"slotBytes\":{},\"periodMs\":{:.4f},"
-                               "\"graceMs\":{:.3f},\"reader\":{},\"head\":{},\"ev\":[",
-                i ? "," : "", jsonString(flow.id), jsonString(flow.format), flow.continuous ? "samples" : "grains",
+            out += fmt::format("{}{{\"id\":{},\"flowId\":{},\"label\":{},\"unit\":\"{}\",\"state\":\"{}\",\"ring\":{},\"slotBytes\":{},"
+                               "\"periodMs\":{:.4f},\"graceMs\":{:.3f},\"reader\":{},\"head\":{},\"ev\":[",
+                i ? "," : "", jsonString(flow.id), jsonString(flow.target), jsonString(flow.format), flow.continuous ? "samples" : "grains",
                 mxlMonitoringAccessName(mxlMonitoringGetFlowAccess(flow.monitor)), flow.ringLength.load(), flow.slotBytes.load(), ms(static_cast<std::int64_t>(flow.periodNs.load())),
                 ms(static_cast<std::int64_t>(flow.graceNs.load())), flow.readerIndex.load(), flow.headSeen.load());
             auto first = true;

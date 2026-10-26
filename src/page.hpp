@@ -47,6 +47,8 @@ namespace
   .chip.ok { color: var(--ok); } .chip.warn { color: var(--warn); } .chip.bad { color: #ff9a73; }
   .chip.zero { opacity: 0.4; }
   .err { color: #ff9a73; font-size: 13px; margin-top: 8px; }
+  .flowid { font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--dim);
+            margin: -4px 0 10px; overflow-wrap: anywhere; user-select: all; }
   h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 10px; color: var(--dim); }
 </style>
 </head>
@@ -60,6 +62,7 @@ namespace
 <main>
   <section class="panel ring">
     <h2 id="ringTitle">Ring</h2>
+    <div class="flowid" id="flowId"></div>
     <canvas id="ring" width="900" height="900"></canvas>
     <div class="numbers ringinfo" id="ringInfo"></div>
     <div class="legend">
@@ -326,6 +329,11 @@ function frame() {
   const flow = flows.get(selected);
   if (flow) {
     document.getElementById('ringTitle').textContent = `Ring of ${flow.meta.label || flow.meta.id}`;
+    // A slot an NMOS controller connects is named on its own and may read
+    // another flow, or none.
+    const meta = flow.meta;
+    document.getElementById('flowId').textContent = !meta.flowId ? `slot ${meta.id}, no flow connected`
+      : meta.flowId === meta.id ? `flow ${meta.flowId}` : `slot ${meta.id}, flow ${meta.flowId}`;
     drawRing(flow, now);
     drawStrip(flow, now);
     // Four times a second: faster than that, digits blur instead of reading.
