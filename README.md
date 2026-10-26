@@ -141,9 +141,10 @@ slot without a flow, a flow read twice, or an unnamed flow beside `--nmos-seed`;
 docker build -t dmf-mf-mxl-reader:dev .
 ```
 
-The build runs `mxl-reader-tests`, the `--expect` handling in `src/checks.hpp`
-and the request handling in `src/http.hpp`, and `mxl-reader-nmos-tests`, the
-NMOS Node in `src/nmos.hpp`, and fails with them. The checks a grain or a
+The build runs the unit tests in `tests/unittests`: `mxl-reader-tests`, the
+`--expect` handling in `src/checks.hpp` and the request handling in
+`src/http.hpp`, and `mxl-reader-nmos-tests`, the NMOS Node in `src/nmos.hpp`,
+and fails with them. The checks a grain or a
 batch of samples goes through are tested in libmxl-monitoring, which
 `MONITORING_REF` pins.
 

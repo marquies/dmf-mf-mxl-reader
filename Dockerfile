@@ -34,7 +34,9 @@ RUN git clone https://github.com/marquies/libmxl-monitoring.git libmxl-monitorin
  && echo 'add_subdirectory(libmxl-monitoring)' >> CMakeLists.txt
 
 COPY src/ /src/tools/mxl-reader/
-RUN echo 'add_subdirectory(mxl-reader)' >> tools/CMakeLists.txt
+COPY tests/unittests/ /src/tools/mxl-reader-unittests/
+RUN echo 'add_subdirectory(mxl-reader)' >> tools/CMakeLists.txt \
+ && echo 'add_subdirectory(mxl-reader-unittests)' >> tools/CMakeLists.txt
 
 # go-mxl-builder ships vcpkg with CLI11, fmt and libfabric provisioned.
 RUN cmake -S . -B build \
@@ -44,8 +46,8 @@ RUN cmake -S . -B build \
         -DCMAKE_TOOLCHAIN_FILE=/root/vcpkg/scripts/buildsystems/vcpkg.cmake \
         -DMXL_READER_VERSION="${VERSION}" \
     && cmake --build build --target mxl-reader mxl-reader-tests mxl-reader-nmos-tests mxl-info -j \
-    && build/tools/mxl-reader/mxl-reader-tests \
-    && build/tools/mxl-reader/mxl-reader-nmos-tests
+    && build/tools/mxl-reader-unittests/mxl-reader-tests \
+    && build/tools/mxl-reader-unittests/mxl-reader-nmos-tests
 
 FROM ghcr.io/qvest-digital/go-mxl-runtime:${GO_MXL_TAG}
 
