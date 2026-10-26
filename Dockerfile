@@ -35,8 +35,10 @@ RUN git clone https://github.com/marquies/libmxl-monitoring.git libmxl-monitorin
 
 COPY src/ /src/tools/mxl-reader/
 COPY tests/unittests/ /src/tools/mxl-reader-unittests/
+COPY tests/integration/ /src/tools/mxl-reader-integration/
 RUN echo 'add_subdirectory(mxl-reader)' >> tools/CMakeLists.txt \
- && echo 'add_subdirectory(mxl-reader-unittests)' >> tools/CMakeLists.txt
+ && echo 'add_subdirectory(mxl-reader-unittests)' >> tools/CMakeLists.txt \
+ && echo 'add_subdirectory(mxl-reader-integration)' >> tools/CMakeLists.txt
 
 # go-mxl-builder ships vcpkg with CLI11, fmt and libfabric provisioned.
 RUN cmake -S . -B build \
@@ -45,9 +47,11 @@ RUN cmake -S . -B build \
         -DMXL_ENABLE_FABRICS_OFI=ON \
         -DCMAKE_TOOLCHAIN_FILE=/root/vcpkg/scripts/buildsystems/vcpkg.cmake \
         -DMXL_READER_VERSION="${VERSION}" \
-    && cmake --build build --target mxl-reader mxl-reader-tests mxl-reader-nmos-tests mxl-info -j \
+    && cmake --build build --target mxl-reader mxl-reader-tests mxl-reader-nmos-tests mxl-pattern-writer mxl-info -j \
     && build/tools/mxl-reader-unittests/mxl-reader-tests \
-    && build/tools/mxl-reader-unittests/mxl-reader-nmos-tests
+    && build/tools/mxl-reader-unittests/mxl-reader-nmos-tests \
+    && python3 tools/mxl-reader-integration/integration-test.py \
+        build/tools/mxl-reader/mxl-reader build/tools/mxl-reader-integration/mxl-pattern-writer
 
 FROM ghcr.io/qvest-digital/go-mxl-runtime:${GO_MXL_TAG}
 
