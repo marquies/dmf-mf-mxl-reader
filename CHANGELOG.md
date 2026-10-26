@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.0.0-rc.8](https://github.com/marquies/dmf-mf-mxl-reader/compare/v1.0.0-rc.7...v1.0.0-rc.8) (2026-10-26)
+
+
+### Features
+
+* show the id of the flow each ring reads ([#16](https://github.com/marquies/dmf-mf-mxl-reader/issues/16)) ([1c6c1f3](https://github.com/marquies/dmf-mf-mxl-reader/commit/1c6c1f3001bdf981f4577ab987ac2adac5b75ba2))
+
+
+### Bug Fixes
+
+* **deps:** move onto go-mxl 1.1.0-rc.7 and its libmxl ([#15](https://github.com/marquies/dmf-mf-mxl-reader/issues/15)) ([79aff98](https://github.com/marquies/dmf-mf-mxl-reader/commit/79aff9865350a3eff878097b1f63010ab45f2f45))
+
 ## [1.0.0-rc.7](https://github.com/marquies/dmf-mf-mxl-reader/compare/v1.0.0-rc.6...v1.0.0-rc.7) (2026-10-26)
 
 
