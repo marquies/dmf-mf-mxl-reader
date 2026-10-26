@@ -12,15 +12,26 @@ ARG GO_MXL_TAG=1.0.0-rc.12
 ARG MXL_SRC=https://github.com/dmf-mxl/mxl.git
 ARG MXL_REF=4a8a50e7
 
+# libmxl-monitoring counts, checks and renders what the reader reads; built
+# into the same tree and linked statically. Checked out by commit, which a
+# moved tag cannot change; the tag names the release it is.
+# renovate: datasource=github-tags depName=marquies/libmxl-monitoring
+ARG MONITORING_TAG=v0.2.0
+ARG MONITORING_REF=c034ebf78a97a0d65e217021bff1ad693c9639c3
+
 FROM ghcr.io/qvest-digital/go-mxl-builder:${GO_MXL_TAG} AS build
 ARG MXL_REF
 ARG MXL_SRC
+ARG MONITORING_REF
 # What the binary reports as its version: the release, or the commit.
 ARG VERSION=dev
 
 WORKDIR /src
 # A full clone: GitHub refuses a shallow fetch of an arbitrary commit by SHA.
 RUN git clone "${MXL_SRC}" . && git checkout "${MXL_REF}"
+RUN git clone https://github.com/marquies/libmxl-monitoring.git libmxl-monitoring \
+ && git -C libmxl-monitoring checkout "${MONITORING_REF}" \
+ && echo 'add_subdirectory(libmxl-monitoring)' >> CMakeLists.txt
 
 COPY src/ /src/tools/mxl-reader/
 RUN echo 'add_subdirectory(mxl-reader)' >> tools/CMakeLists.txt

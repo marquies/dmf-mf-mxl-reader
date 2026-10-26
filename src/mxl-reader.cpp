@@ -5,9 +5,10 @@
 // the head is what shows whether that replica keeps up. Each flow is read on a
 // thread of its own. Every read is classified - correct, not there when due,
 // overtaken, unreadable, or there but wrong - and counted, so a load or failure
-// test sees exactly which way a flow went bad. The counts are served as
-// Prometheus text on /metrics and as JSON on /status; /delivering answers 200
-// only while every connected flow delivers.
+// test sees exactly which way a flow went bad. The classification, the checks
+// and the counts are libmxl-monitoring's; they are served as Prometheus text
+// on /metrics and as JSON on /status; /delivering answers 200 only while every
+// connected flow delivers.
 //
 // With --nmos-seed the reader is also an NMOS Node (AMWA IS-04, IS-05 and
 // BCP-007-03): each named reader slot is an MXL Receiver a controller connects
@@ -21,6 +22,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <deque>
@@ -41,6 +43,10 @@
 
 #include <CLI/CLI.hpp>
 #include <fmt/format.h>
+#include <mxl-monitoring/content.h>
+#include <mxl-monitoring/monitoring.h>
+#include <mxl-monitoring/prometheus.h>
+#include <mxl-monitoring/reader.h>
 #include <mxl/flow.h>
 #include <mxl/flowinfo.h>
 #include <mxl/mxl.h>
@@ -54,9 +60,7 @@
 
 namespace
 {
-    using reader::Declared;
     using reader::Expectation;
-    using reader::GrainOutcome;
 
     std::atomic<bool> stopping{false};
     // Set by a thread that cannot do its job at all, so the process exits
@@ -81,34 +85,6 @@ namespace
         auto lib = mxlVersionType{};
         mxlGetVersion(&lib);
         return fmt::format("mxl-reader {} (libmxl {})", MXL_READER_VERSION, lib.full != nullptr ? lib.full : "unknown");
-    }
-
-    // Where a flow's reader stands, as one word for a page and a metric label.
-    enum class State
-    {
-        Starting,
-        DomainUnavailable,
-        FlowNotFound,
-        PermissionDenied,
-        FlowError,
-        Open,
-        // A named slot no flow is connected to: it reads nothing on purpose.
-        Disconnected,
-    };
-
-    char const* stateName(State state)
-    {
-        switch (state)
-        {
-            case State::Starting:          return "starting";
-            case State::DomainUnavailable: return "domain_unavailable";
-            case State::FlowNotFound:      return "flow_not_found";
-            case State::PermissionDenied:  return "permission_denied";
-            case State::FlowError:         return "flow_error";
-            case State::Open:              return "open";
-            case State::Disconnected:      return "disconnected";
-        }
-        return "unknown";
     }
 
     // One thing that happened to a flow, for the ring view: a grain or a batch
@@ -136,12 +112,16 @@ namespace
     // The ring view's window: enough for several seconds of a 240/1 flow.
     constexpr std::size_t EventsKept = 4096;
 
+    // A reader slot. What is counted of it - reads, open failures, state, age
+    // - is libmxl-monitoring's, in `monitor`; what is kept here is what the
+    // ring view and /status show beyond that.
     struct FlowStats
     {
-        // What the slot is keyed by: its flow id, or its name for a named
-        // slot, which keeps it whichever flow it reads.
+        // What the slot is keyed by and reported as: its flow id, or its name
+        // for a named slot, which keeps it whichever flow it reads.
         std::string id;
         std::optional<Expectation> expected;
+        mxlMonitoringFlow monitor = nullptr;
 
         // The flow the slot reads; empty reads nothing. An NMOS controller
         // can change it while the slot runs: written under mutex, and every
@@ -150,37 +130,7 @@ namespace
         std::string target;
         std::atomic<std::uint64_t> generation{0};
 
-        std::atomic<State> state{State::Starting};
         std::atomic<bool> continuous{false};
-
-        // Reads, in grains (discrete) or samples (continuous); tooEarly and
-        // tooLate count events.
-        std::atomic<std::uint64_t> ok{0};
-        std::atomic<std::uint64_t> tooEarly{0};
-        std::atomic<std::uint64_t> tooLate{0};
-        std::atomic<std::uint64_t> skipped{0};
-        std::atomic<std::uint64_t> missing{0};
-        std::atomic<std::uint64_t> invalid{0};
-        std::atomic<std::uint64_t> incomplete{0};
-        std::atomic<std::uint64_t> wrongSize{0};
-        std::atomic<std::uint64_t> wrongFormat{0};
-        std::atomic<std::uint64_t> illegal{0};
-        std::atomic<std::uint64_t> readPermission{0};
-        std::atomic<std::uint64_t> readOther{0};
-
-        // Attempts to reach the flow at all.
-        std::atomic<std::uint64_t> domainErrors{0};
-        std::atomic<std::uint64_t> flowNotFound{0};
-        std::atomic<std::uint64_t> flowPermission{0};
-        std::atomic<std::uint64_t> flowOther{0};
-        std::atomic<std::uint64_t> opens{0};
-        std::atomic<std::uint64_t> lost{0};
-        std::atomic<std::uint64_t> stalls{0};
-
-        std::atomic<std::uint64_t> lastReadAt{0};
-        std::atomic<std::uint64_t> lastProgressAt{0};
-        std::atomic<bool> stallCounted{false};
-        std::atomic<std::int64_t> ageNs{0};
 
         // What the ring view draws against: the ring's length in grains or
         // samples, the payload bytes of one slot (a grain, or one sample of
@@ -193,12 +143,12 @@ namespace
         std::atomic<std::uint64_t> graceNs{0};
         std::atomic<std::uint64_t> readerIndex{0};
         std::atomic<std::uint64_t> headSeen{0};
+        // Whether the ring view has been shown the current stall.
+        std::atomic<bool> stallShown{false};
 
         // Read by the HTTP thread, written by the flow's own.
         mutable std::mutex mutex;
-        std::string mediaType;
         std::string format;
-        std::string formatMismatch;
         std::string lastError;
         std::uint64_t lastErrorAt = 0;
         std::deque<GrainEvent> events;
@@ -233,18 +183,15 @@ namespace
         return {stats.target, stats.generation.load()};
     }
 
-    // Forgets what was read from the flow before: the counters stay, the
-    // description and the ring view start over. Called with mutex held.
+    // Forgets what the ring view and /status showed of the flow before; the
+    // library forgets its part when the reader thread retargets the slot.
+    // Called with mutex held.
     void forgetFlow(FlowStats& stats)
     {
-        stats.mediaType.clear();
         stats.format.clear();
-        stats.formatMismatch.clear();
         stats.lastError.clear();
         stats.lastErrorAt = 0;
         stats.events.clear();
-        stats.lastReadAt = 0;
-        stats.ageNs = 0;
         stats.ringLength = 0;
         stats.slotBytes = 0;
         stats.readerIndex = 0;
@@ -264,9 +211,10 @@ namespace
     }
 
     // The reader thread forgets the flow it leaves as well, once it has
-    // stopped reading it.
-    void leaveFlow(FlowStats& stats)
+    // stopped reading it, and points the slot's monitoring at the new one.
+    void leaveFlow(FlowStats& stats, std::string const& flow)
     {
+        mxlMonitoringSetFlowTarget(stats.monitor, flow.c_str());
         auto const lock = std::lock_guard{stats.mutex};
         forgetFlow(stats);
     }
@@ -302,36 +250,28 @@ namespace
         return fallback;
     }
 
-    void markRead(FlowStats& stats, mxlRational const& rate, std::uint64_t index)
-    {
-        auto const now = mxlGetTime();
-        stats.lastReadAt = now;
-        stats.lastProgressAt = now;
-        stats.stallCounted = false;
-        stats.ageNs = static_cast<std::int64_t>(now) - static_cast<std::int64_t>(mxlIndexToTimestamp(&rate, index));
-    }
-
     // Nothing to read yet. That is the normal state of a reader at the head
-    // until the next grain is due; it counts as too early only once the index
-    // is a grace period past due, and once per index. A stall is a whole read
-    // timeout with no read at all, counted once until reads resume. The sleep
-    // lasts until the index is due, at most 5 ms, so a non-blocking read cannot
-    // spin. Returns whether a whole timeout has passed without a read.
-    bool awaitIndex(FlowStats& stats, mxlRational const& rate, std::uint64_t index, std::uint64_t graceNs,
-        std::uint64_t timeoutNs, std::uint64_t& earlyCounted)
+    // until the next grain is due; the library counts it as too early only
+    // once the index is a grace period past due, and once per index, and a
+    // stall once per read timeout with no read at all. The ring view shows
+    // both by the same rules. The sleep lasts until the index is due, at most
+    // 5 ms, so a non-blocking read cannot spin. Returns whether a whole
+    // timeout has passed without a read.
+    bool awaitIndex(FlowStats& stats, mxlStatus status, mxlRational const& rate, std::uint64_t index, std::uint64_t graceNs,
+        std::uint64_t timeoutNs, std::uint64_t& earlyShown)
     {
+        mxlMonitoringRecordRead(stats.monitor, status, index, 1);
         auto const now = mxlGetTime();
         auto const due = mxlIndexToTimestamp(&rate, index);
-        if (earlyCounted != index && now > due + graceNs)
+        if (earlyShown != index && now > due + graceNs)
         {
-            ++stats.tooEarly;
-            earlyCounted = index;
+            earlyShown = index;
             stats.record({.index = index, .seenNs = now, .arrivalNs = static_cast<std::int64_t>(now - due), .kind = 'e'});
         }
-        auto const timedOut = now - stats.lastProgressAt >= timeoutNs;
-        if (timedOut && !stats.stallCounted.exchange(true))
+        auto const progress = mxlMonitoringFlowLastProgress(stats.monitor);
+        auto const timedOut = now >= progress && now - progress >= timeoutNs;
+        if (timedOut && !stats.stallShown.exchange(true))
         {
-            ++stats.stalls;
             stats.record({.index = index, .seenNs = now, .arrivalNs = static_cast<std::int64_t>(now - due), .kind = 't'});
         }
         mxlSleepForNs(std::clamp<std::uint64_t>(mxlGetNsUntilIndex(index, &rate), NsPerSecond / 1000, NsPerSecond / 200));
@@ -348,80 +288,45 @@ namespace
         return std::max(readNs, commitNs) + NsPerSecond / 20;
     }
 
-    std::optional<Declared> readDefinition(mxlInstance instance, std::string const& id)
+    char kindOf(mxlMonitoringContent issue)
     {
-        auto buffer = std::vector<char>(8192);
-        auto size = buffer.size();
-        auto status = mxlGetFlowDef(instance, id.c_str(), buffer.data(), &size);
-        if (status == MXL_ERR_INVALID_ARG && size > buffer.size())
+        switch (issue)
         {
-            buffer.resize(size);
-            status = mxlGetFlowDef(instance, id.c_str(), buffer.data(), &size);
-        }
-        if (status != MXL_STATUS_OK)
-        {
-            return std::nullopt;
-        }
-        return reader::parseDefinition(std::string{buffer.data()});
-    }
-
-    // libmxl reports a reader it could not open for want of permission as an
-    // unknown error, so the files themselves are asked.
-    bool permissionDenied(std::string const& domain, std::string const& id)
-    {
-        auto const dir = fmt::format("{}/{}.mxl-flow", domain, id);
-        auto const denied = [](std::string const& path, int mode) {
-            struct stat st{};
-            return ::stat(path.c_str(), &st) == 0 && ::access(path.c_str(), mode) != 0 && (errno == EACCES || errno == EPERM);
-        };
-        // A directory has to be traversable as well as readable.
-        if (denied(dir, R_OK | X_OK) || denied(dir + "/grains", R_OK | X_OK))
-        {
-            return true;
-        }
-        for (auto const& path : {dir + "/flow_def.json", dir + "/data", dir + "/grains/data.0"})
-        {
-            if (denied(path, R_OK))
-            {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    // Returns the status that ended the loop: anything other than a read that
-    // is merely early or late means the reader no longer holds a usable flow.
-    void countGrain(FlowStats& stats, GrainOutcome outcome)
-    {
-        switch (outcome)
-        {
-            case GrainOutcome::Ok:          ++stats.ok; break;
-            case GrainOutcome::WrongFormat: ++stats.wrongFormat; break;
-            case GrainOutcome::Missing:     ++stats.missing; break;
-            case GrainOutcome::Invalid:     ++stats.invalid; break;
-            case GrainOutcome::Incomplete:  ++stats.incomplete; break;
-            case GrainOutcome::WrongSize:   ++stats.wrongSize; break;
-            case GrainOutcome::Illegal:     ++stats.illegal; break;
-        }
-    }
-
-    char kindOf(GrainOutcome outcome)
-    {
-        switch (outcome)
-        {
-            case GrainOutcome::Ok:          return 'k';
-            case GrainOutcome::WrongFormat: return 'f';
-            case GrainOutcome::Missing:     return 'm';
-            case GrainOutcome::Invalid:     return 'v';
-            case GrainOutcome::Incomplete:  return 'p';
-            case GrainOutcome::WrongSize:   return 's';
-            case GrainOutcome::Illegal:     return 'x';
+            case MXL_MONITORING_CONTENT_WRONG_FORMAT:
+            case MXL_MONITORING_CONTENT_WRONG_RESOLUTION:
+            case MXL_MONITORING_CONTENT_WRONG_RATE:       return 'f';
+            case MXL_MONITORING_CONTENT_WRONG_SIZE:       return 's';
+            case MXL_MONITORING_CONTENT_MISSING:          return 'm';
+            case MXL_MONITORING_CONTENT_INVALID:          return 'v';
+            case MXL_MONITORING_CONTENT_INCOMPLETE:       return 'p';
+            case MXL_MONITORING_CONTENT_ILLEGAL_VALUES:   return 'x';
+            case MXL_MONITORING_CONTENT_COUNT:            break;
         }
         return 'k';
     }
 
+    // What the checks found in data read at index: counted with the library
+    // as good or as the one issue it has, and returned as its ring view kind.
+    char count(FlowStats& stats, bool found, mxlMonitoringContent issue, char const* where, std::uint64_t index, std::uint64_t units)
+    {
+        if (!found)
+        {
+            mxlMonitoringRecordRead(stats.monitor, MXL_STATUS_OK, index, units);
+            stats.stallShown = false;
+            return 'k';
+        }
+        if (issue == MXL_MONITORING_CONTENT_ILLEGAL_VALUES)
+        {
+            stats.error(fmt::format("illegal sample value: {}", where));
+        }
+        mxlMonitoringRecordReadContent(stats.monitor, issue, index, units);
+        stats.stallShown = false;
+        return kindOf(issue);
+    }
+
     // The event for an index just read: when it was seen, and, when it is the
-    // head, when it was committed on this node.
+    // head, when it was committed on this node, which the library takes as
+    // the commit latency.
     GrainEvent readEvent(mxlFlowReader reader, mxlRational const& rate, std::uint64_t index, char kind, std::uint64_t count,
         FlowStats& stats)
     {
@@ -436,16 +341,27 @@ namespace
             if (runtime.headIndex == index && runtime.lastWriteTime != 0)
             {
                 event.commitNs = static_cast<std::int64_t>(runtime.lastWriteTime) - due;
+                mxlMonitoringRecordCommit(stats.monitor, index, runtime.lastWriteTime);
             }
         }
         stats.readerIndex = index;
         return event;
     }
 
+    // What one open of a flow reads against: its definition, how it differs
+    // from what was expected, and whether sample values are checked.
+    struct Checks
+    {
+        mxlMonitoringDeclared declared{};
+        std::uint32_t mismatch = 0;
+        bool checkLegal = false;
+    };
+
     // Returns the status that ended the loop: anything other than a read that
     // is merely early or late means the reader no longer holds a usable flow.
-    mxlStatus readDiscrete(mxlFlowReader reader, mxlFlowConfigInfo const& config, Declared const& declared, bool wrongFormat,
-        FlowStats& stats, std::uint64_t generation)
+    // The library has counted it by then.
+    mxlStatus readDiscrete(mxlFlowReader reader, mxlFlowConfigInfo const& config, Checks const& checks, FlowStats& stats,
+        std::uint64_t generation)
     {
         auto const& rate = config.common.grainRate;
         // Several grain periods, so a writer that commits a grain late is a
@@ -453,26 +369,23 @@ namespace
         auto const period = periodNs(rate);
         auto const timeoutNs = std::max<std::uint64_t>(4 * period, NsPerSecond / 10);
         auto const grace = graceNs(config, period, false);
-        auto const checkLegal = stats.expected && stats.expected->checkLegal;
+        mxlMonitoringSetFlowTiming(stats.monitor, grace, timeoutNs);
         stats.ringLength = config.discrete.grainCount;
         stats.periodNs = period;
         stats.graceNs = grace;
         auto index = headIndex(reader, mxlGetCurrentIndex(&rate));
-        auto earlyCounted = std::uint64_t{0};
+        auto earlyShown = std::uint64_t{0};
         auto const take = [&](mxlGrainInfo const& grain, std::uint8_t const* payload) {
-            auto where = std::string{};
-            auto const outcome = reader::classifyGrain(grain, index, payload, declared, wrongFormat, checkLegal, &where);
-            countGrain(stats, outcome);
-            if (outcome == GrainOutcome::Illegal)
-            {
-                stats.error("illegal sample value: " + where);
-            }
+            auto issue = mxlMonitoringContent{};
+            auto where = std::array<char, MXL_MONITORING_TEXT>{};
+            auto const found = mxlMonitoringCheckGrain(&checks.declared, checks.mismatch, checks.checkLegal, &grain, index, payload, &issue,
+                where.data(), where.size());
+            auto const kind = count(stats, found, issue, where.data(), index, 1);
             if (grain.grainSize > 0)
             {
                 stats.slotBytes = grain.grainSize;
             }
-            stats.record(readEvent(reader, rate, index, kindOf(outcome), 1, stats));
-            markRead(stats, rate, index);
+            stats.record(readEvent(reader, rate, index, kind, 1, stats));
             ++index;
         };
         while (!stopping && stats.generation == generation)
@@ -490,11 +403,12 @@ namespace
                 {
                     // The ring overwrote the grain before it was read: jump to
                     // the head and count what was lost on the way.
-                    ++stats.tooLate;
+                    mxlMonitoringRecordRead(stats.monitor, status, index, 1);
                     auto const head = headIndex(reader, mxlGetCurrentIndex(&rate));
-                    stats.skipped += head > index ? head - index : 1;
+                    auto const lost = head > index ? head - index : 1;
+                    mxlMonitoringRecordSkipped(stats.monitor, lost);
                     stats.record({.index = index, .seenNs = mxlGetTime(), .behind = static_cast<std::int64_t>(head - index), .kind = 'l',
-                        .count = head > index ? head - index : 1});
+                        .count = lost});
                     index = head > index ? head : index + 1;
                     break;
                 }
@@ -519,7 +433,7 @@ namespace
                     // A writer whose clock stepped back leaves its head behind
                     // the index waited on; follow the head once a whole timeout
                     // has passed instead of waiting for the clock to catch up.
-                    if (awaitIndex(stats, rate, index, grace, timeoutNs, earlyCounted))
+                    if (awaitIndex(stats, status, rate, index, grace, timeoutNs, earlyShown))
                     {
                         if (auto const head = headIndex(reader, index); head + 1 < index)
                         {
@@ -528,14 +442,14 @@ namespace
                     }
                     break;
                 }
-                default: return status;
+                default: mxlMonitoringRecordRead(stats.monitor, status, index, 1); return status;
             }
         }
         return MXL_STATUS_OK;
     }
 
-    mxlStatus readContinuous(mxlFlowReader reader, mxlFlowConfigInfo const& config, Declared const& declared,
-        bool wrongFormat, FlowStats& stats, std::uint64_t generation)
+    mxlStatus readContinuous(mxlFlowReader reader, mxlFlowConfigInfo const& config, Checks const& checks, FlowStats& stats,
+        std::uint64_t generation)
     {
         auto const& rate = config.common.grainRate;
         // Ten milliseconds of samples, or the writer's own signalling batch when
@@ -550,10 +464,10 @@ namespace
         stats.periodNs = periodNs(rate);
         auto const timeoutNs = std::max<std::uint64_t>(4 * batchNs, NsPerSecond / 10);
         auto const grace = graceNs(config, batchNs, true);
+        mxlMonitoringSetFlowTiming(stats.monitor, grace, timeoutNs);
         stats.graceNs = grace;
-        auto const float32 = declared.mediaType == "audio/float32" && stats.expected && stats.expected->checkLegal;
         auto index = headIndex(reader, mxlGetCurrentIndex(&rate));
-        auto earlyCounted = std::uint64_t{0};
+        auto earlyShown = std::uint64_t{0};
         while (!stopping && stats.generation == generation)
         {
             auto const next = index + batch;
@@ -575,39 +489,29 @@ namespace
                     {
                         stats.slotBytes = channelBytes / batch * slices.count;
                     }
-                    auto kind = 'k';
-                    if (wrongFormat)
-                    {
-                        stats.wrongFormat += batch;
-                        kind = 'f';
-                    }
-                    else if (float32 && !reader::samplesLegal(slices))
-                    {
-                        stats.illegal += batch;
-                        kind = 'x';
-                    }
-                    else
-                    {
-                        stats.ok += batch;
-                    }
+                    auto issue = mxlMonitoringContent{};
+                    auto where = std::array<char, MXL_MONITORING_TEXT>{};
+                    auto const found = mxlMonitoringCheckSamples(&checks.declared, checks.mismatch, checks.checkLegal, &slices, &issue,
+                        where.data(), where.size());
+                    auto const kind = count(stats, found, issue, where.data(), next, batch);
                     stats.record(readEvent(reader, rate, next, kind, batch, stats));
-                    markRead(stats, rate, next);
                     index = next;
                     break;
                 }
                 case MXL_ERR_OUT_OF_RANGE_TOO_LATE:
                 {
-                    ++stats.tooLate;
+                    mxlMonitoringRecordRead(stats.monitor, status, index, 1);
                     auto const head = headIndex(reader, mxlGetCurrentIndex(&rate));
-                    stats.skipped += head > index ? head - index : batch;
+                    auto const lost = head > index ? head - index : batch;
+                    mxlMonitoringRecordSkipped(stats.monitor, lost);
                     stats.record({.index = index, .seenNs = mxlGetTime(), .behind = static_cast<std::int64_t>(head - index), .kind = 'l',
-                        .count = head > index ? head - index : batch});
+                        .count = lost});
                     index = head > index ? head : next;
                     break;
                 }
                 case MXL_ERR_OUT_OF_RANGE_TOO_EARLY:
                 case MXL_ERR_TIMEOUT:
-                    if (awaitIndex(stats, rate, next, grace, timeoutNs, earlyCounted))
+                    if (awaitIndex(stats, status, rate, next, grace, timeoutNs, earlyShown))
                     {
                         if (auto const head = headIndex(reader, index); head < index)
                         {
@@ -615,7 +519,7 @@ namespace
                         }
                     }
                     break;
-                default:                            return status;
+                default: mxlMonitoringRecordRead(stats.monitor, status, next, batch); return status;
             }
         }
         return MXL_STATUS_OK;
@@ -633,24 +537,21 @@ namespace
                 // Whatever this thread recorded of the flow it left, after
                 // retarget() cleared it, goes too: a read or an error that was
                 // under way when the slot moved.
-                leaveFlow(stats);
+                leaveFlow(stats, flow);
                 seen = generation;
             }
             if (flow.empty())
             {
-                stats.state = State::Disconnected;
                 pause(stats, generation, NsPerSecond);
                 continue;
             }
             if (instance == nullptr)
             {
-                instance = mxlCreateInstance(domain.c_str(), "");
+                // The volume may not be mounted yet, or the agent has not
+                // created the domain: wait for it rather than exit.
+                instance = mxlMonitoringCreateInstance(stats.monitor, domain.c_str(), "");
                 if (instance == nullptr)
                 {
-                    // The volume may not be mounted yet, or the agent has not
-                    // created the domain: wait for it rather than exit.
-                    ++stats.domainErrors;
-                    stats.state = State::DomainUnavailable;
                     struct stat st{};
                     stats.error(::stat(domain.c_str(), &st) == 0 ? fmt::format("cannot open MXL domain {}", domain)
                                                                   : fmt::format("MXL domain {} does not exist", domain));
@@ -659,79 +560,71 @@ namespace
                 }
             }
 
+            // Not there yet: the flow is still being mirrored here, or its
+            // writer has not started. Keep asking rather than exiting, so the
+            // pod waits for the flow instead of crash-looping until it lands.
+            // A reader that opens but cannot read the flow's info or
+            // definition is released again: nothing can be checked against a
+            // flow that is not described.
             mxlFlowReader reader = nullptr;
-            auto status = mxlCreateFlowReader(instance, flow.c_str(), "", &reader);
+            auto status = mxlMonitoringCreateFlowReader(stats.monitor, instance, "", &reader);
+            auto info = mxlFlowInfo{};
+            auto checks = Checks{};
+            if (status == MXL_STATUS_OK)
+            {
+                status = mxlFlowReaderGetInfo(reader, &info);
+                if (status != MXL_STATUS_OK)
+                {
+                    mxlReleaseFlowReader(instance, reader);
+                    auto const message = fmt::format("cannot read the info of flow {}: status {}", flow, static_cast<int>(status));
+                    mxlMonitoringDescribe(stats.monitor, MXL_MONITORING_CONDITION_ACCESS, MXL_MONITORING_ACCESS_OTHER, MXL_MONITORING_CONTENT_COUNT,
+                        message.c_str());
+                    mxlMonitoringRecordAccess(stats.monitor, MXL_MONITORING_ACCESS_OTHER, status);
+                }
+                mxlMonitoringGetDeclared(stats.monitor, &checks.declared);
+            }
             if (status != MXL_STATUS_OK)
             {
-                // Not there yet: the flow is still being mirrored here, or its
-                // writer has not started. Keep asking rather than exiting, so the
-                // pod waits for the flow instead of crash-looping until it lands.
-                if (status == MXL_ERR_FLOW_NOT_FOUND || status == MXL_ERR_NOT_FOUND)
-                {
-                    ++stats.flowNotFound;
-                    stats.state = State::FlowNotFound;
-                    stats.error("flow " + flow + " not found in the domain");
-                }
-                else if (status == MXL_ERR_PERMISSION_DENIED || permissionDenied(domain, flow))
-                {
-                    ++stats.flowPermission;
-                    stats.state = State::PermissionDenied;
-                    stats.error("permission denied opening flow " + flow);
-                }
-                else
-                {
-                    ++stats.flowOther;
-                    stats.state = State::FlowError;
-                    stats.error(fmt::format("cannot open flow {}: status {}", flow, static_cast<int>(status)));
-                }
-                pause(stats, generation, NsPerSecond);
-                continue;
-            }
-
-            auto info = mxlFlowInfo{};
-            status = mxlFlowReaderGetInfo(reader, &info);
-            auto const definition = status == MXL_STATUS_OK ? readDefinition(instance, flow) : std::nullopt;
-            if (!definition)
-            {
-                // Opened but not described: nothing can be checked against an
-                // absent definition, so this is a failure to reach the flow.
-                mxlReleaseFlowReader(instance, reader);
-                ++stats.flowOther;
-                stats.state = State::FlowError;
-                stats.error(status == MXL_STATUS_OK ? "cannot read the definition of flow " + flow
-                                                    : fmt::format("cannot read the info of flow {}: status {}", flow, static_cast<int>(status)));
+                // The library said what failed, naming the flow.
+                auto detail = std::array<char, MXL_MONITORING_TEXT>{};
+                mxlMonitoringGetLastErrorDetail(stats.monitor, detail.data(), detail.size());
+                stats.error(detail.data());
                 pause(stats, generation, NsPerSecond);
                 continue;
             }
             if (stats.generation != generation)
             {
-                // Moved while opening: describe nothing of the flow left.
+                // Moved while opening. The library has counted the open; the
+                // reader thread forgets the flow when it takes up the next.
                 mxlReleaseFlowReader(instance, reader);
                 continue;
             }
             {
-                auto const& declared = *definition;
-                auto const wrong = reader::mismatch(declared, stats.expected);
+                auto const& declared = checks.declared;
+                auto wrong = std::array<char, MXL_MONITORING_TEXT>{};
+                if (stats.expected)
+                {
+                    auto const expected = reader::toMonitoring(*stats.expected);
+                    checks.mismatch = mxlMonitoringMismatch(&declared, &expected, wrong.data(), wrong.size());
+                    checks.checkLegal = stats.expected->checkLegal;
+                }
                 {
                     auto const lock = std::lock_guard{stats.mutex};
-                    stats.mediaType = declared.mediaType;
-                    stats.format = declared.width ? fmt::format("{}x{} @ {}", declared.width, declared.height, declared.rate)
+                    auto const rate = declared.rate.denominator > 0 ? fmt::format("{}/{}", declared.rate.numerator, declared.rate.denominator)
+                                                                    : std::string{};
+                    stats.format = declared.width ? fmt::format("{}x{} @ {}", declared.width, declared.height, rate)
                                  : declared.sampleRate ? fmt::format("{} ch @ {}", declared.channels, declared.sampleRate)
                                                        : std::string{};
-                    stats.formatMismatch = wrong;
                 }
-                if (!wrong.empty())
+                if (checks.mismatch != 0)
                 {
-                    stats.error("format differs from what was expected: " + wrong);
+                    stats.error(fmt::format("format differs from what was expected: {}", wrong.data()));
                 }
-                ++stats.opens;
                 stats.continuous = info.config.common.format == MXL_DATA_FORMAT_AUDIO;
-                stats.lastProgressAt = mxlGetTime();
-                stats.state = State::Open;
-                std::fprintf(stderr, "flow %s: open %s, %s %s\n", stats.id.c_str(), flow.c_str(), declared.mediaType.c_str(),
+                std::fprintf(stderr, "flow %s: open %s, %s %s\n", stats.id.c_str(), flow.c_str(), declared.mediaType,
                     stats.continuous ? "continuous" : "discrete");
-                status = stats.continuous ? readContinuous(reader, info.config, declared, !wrong.empty(), stats, generation)
-                                          : readDiscrete(reader, info.config, declared, !wrong.empty(), stats, generation);
+                status = stats.continuous ? readContinuous(reader, info.config, checks, stats, generation)
+                                          : readDiscrete(reader, info.config, checks, stats, generation);
             }
             mxlReleaseFlowReader(instance, reader);
             if (stopping)
@@ -744,23 +637,18 @@ namespace
                 std::fprintf(stderr, "flow %s: leaving %s for another flow\n", stats.id.c_str(), flow.c_str());
                 continue;
             }
+            // The library counted it when it was read.
             if (status == MXL_ERR_PERMISSION_DENIED)
             {
-                ++stats.readPermission;
-                stats.state = State::PermissionDenied;
                 stats.error("permission denied reading flow " + flow);
             }
             else if (status == MXL_ERR_FLOW_INVALID || status == MXL_ERR_INVALID_FLOW_READER || status == MXL_ERR_FLOW_NOT_FOUND)
             {
                 // Its writer went away or replaced the flow: open it again.
-                ++stats.lost;
-                stats.state = State::FlowNotFound;
                 stats.error("flow " + flow + " went away, reopening");
             }
             else
             {
-                ++stats.readOther;
-                stats.state = State::FlowError;
                 stats.error(fmt::format("reading flow {} failed: status {}, reopening", flow, static_cast<int>(status)));
             }
             pause(stats, generation, NsPerSecond);
@@ -771,160 +659,113 @@ namespace
         }
     }
 
-    // Delivering means a read landed within the last second. A flow that is
-    // open but silent is the failure this reader exists to show.
-    bool delivering(FlowStats const& stats)
-    {
-        auto const last = stats.lastReadAt.load();
-        return stats.state == State::Open && last != 0 && mxlGetTime() - last < NsPerSecond;
-    }
-
     std::string jsonString(std::string const& value)
     {
         return picojson::value{value}.serialize();
     }
 
+    // Every slot's counts from the library, in the order the slots were added.
+    std::vector<mxlMonitoringFlowSnapshot> snapshots(mxlMonitoring monitoring)
+    {
+        auto out = std::vector<mxlMonitoringFlowSnapshot>{};
+        auto count = std::size_t{0};
+        do
+        {
+            out.resize(count);
+            count = out.size();
+            mxlMonitoringSnapshot(monitoring, out.data(), &count);
+        }
+        while (count > out.size());
+        out.resize(count);
+        return out;
+    }
+
     struct Counter
     {
         char const* key;
-        std::atomic<std::uint64_t> FlowStats::*field;
+        std::uint64_t (*value)(mxlMonitoringFlowSnapshot const&);
     };
 
-    // Read outcomes, per grain or per sample. The key is what Grafana and the
-    // page group by.
+    // Read outcomes, per grain or per sample, under the keys /metrics uses.
     constexpr Counter ReadResults[] = {
-        {"ok",               &FlowStats::ok},
-        {"too_early",        &FlowStats::tooEarly},
-        {"too_late",         &FlowStats::tooLate},
-        {"missing",          &FlowStats::missing},
-        {"invalid",          &FlowStats::invalid},
-        {"incomplete",       &FlowStats::incomplete},
-        {"wrong_size",       &FlowStats::wrongSize},
-        {"wrong_format",     &FlowStats::wrongFormat},
-        {"illegal_values",   &FlowStats::illegal},
-        {"permission_error", &FlowStats::readPermission},
-        {"other_error",      &FlowStats::readOther},
+        {"ok",               [](auto const& s) { return s.reads[MXL_MONITORING_READ_OK]; }                },
+        {"too_early",        [](auto const& s) { return s.reads[MXL_MONITORING_READ_TOO_EARLY]; }         },
+        {"too_late",         [](auto const& s) { return s.reads[MXL_MONITORING_READ_TOO_LATE]; }          },
+        {"missing",          [](auto const& s) { return s.content[MXL_MONITORING_CONTENT_MISSING]; }      },
+        {"invalid",          [](auto const& s) { return s.content[MXL_MONITORING_CONTENT_INVALID]; }      },
+        {"incomplete",       [](auto const& s) { return s.content[MXL_MONITORING_CONTENT_INCOMPLETE]; }   },
+        {"wrong_size",       [](auto const& s) { return s.content[MXL_MONITORING_CONTENT_WRONG_SIZE]; }   },
+        {"wrong_format",
+         [](auto const& s) {
+             return s.content[MXL_MONITORING_CONTENT_WRONG_FORMAT] + s.content[MXL_MONITORING_CONTENT_WRONG_RESOLUTION] +
+                    s.content[MXL_MONITORING_CONTENT_WRONG_RATE];
+         }                                                                                                },
+        {"illegal_values",   [](auto const& s) { return s.content[MXL_MONITORING_CONTENT_ILLEGAL_VALUES]; }},
+        {"permission_error", [](auto const& s) { return s.reads[MXL_MONITORING_READ_PERMISSION_DENIED]; } },
+        {"other_error",      [](auto const& s) { return s.reads[MXL_MONITORING_READ_ERROR]; }             },
     };
 
     constexpr Counter OpenFailures[] = {
-        {"domain",     &FlowStats::domainErrors},
-        {"not_found",  &FlowStats::flowNotFound},
-        {"permission", &FlowStats::flowPermission},
-        {"other",      &FlowStats::flowOther},
+        {"domain",     [](auto const& s) { return s.accessFailures[MXL_MONITORING_ACCESS_DOMAIN_UNAVAILABLE]; }  },
+        {"not_found",  [](auto const& s) { return s.accessFailures[MXL_MONITORING_ACCESS_FLOW_NOT_FOUND]; }      },
+        {"permission", [](auto const& s) { return s.accessFailures[MXL_MONITORING_ACCESS_PERMISSION_DENIED]; }   },
+        {"other",
+         [](auto const& s) { return s.accessFailures[MXL_MONITORING_ACCESS_FLOW_INVALID] + s.accessFailures[MXL_MONITORING_ACCESS_OTHER]; }},
     };
 
-    struct Single
+    constexpr Counter Singles[] = {
+        {"skipped", [](auto const& s) { return s.skipped; }},
+        {"stalls",  [](auto const& s) { return s.stalls; } },
+        {"opens",   [](auto const& s) { return s.opens; }  },
+        {"lost",    [](auto const& s) { return s.losses; } },
+    };
+
+    std::string metrics(mxlMonitoring monitoring)
     {
-        char const* key;
-        char const* name;
-        char const* help;
-        std::atomic<std::uint64_t> FlowStats::*field;
-    };
-
-    constexpr Single Singles[] = {
-        {"skipped", "mxl_reader_skipped_total", "Grains or samples jumped over to reach the head again after the ring overtook the reader.", &FlowStats::skipped},
-        {"stalls",  "mxl_reader_stalls_total",  "Read timeouts that passed with no read at all.",                                         &FlowStats::stalls},
-        {"opens",   "mxl_reader_opens_total",   "Times the flow was opened.",                                                             &FlowStats::opens},
-        {"lost",    "mxl_reader_lost_total",    "Times an open flow went away and was reopened.",                                         &FlowStats::lost},
-    };
-
-    std::string metrics(std::vector<std::unique_ptr<FlowStats>> const& flows)
-    {
-        std::string out;
-        out += "# HELP mxl_reader_flow_info Media type and unit of a flow, once it has been opened.\n"
-               "# TYPE mxl_reader_flow_info gauge\n";
-        for (auto const& flow : flows)
+        auto size = std::size_t{0};
+        mxlMonitoringPrometheusRender(monitoring, nullptr, &size);
+        auto buffer = std::vector<char>(size);
+        // Grown for flows added in between: the second call fits or says how much.
+        while (mxlMonitoringPrometheusRender(monitoring, buffer.data(), &size) == MXL_ERR_INVALID_ARG && size > buffer.size())
         {
-            auto const lock = std::lock_guard{flow->mutex};
-            if (flow->opens > 0 && !flow->mediaType.empty())
-            {
-                out += fmt::format("mxl_reader_flow_info{{flow=\"{}\",media_type=\"{}\",unit=\"{}\"}} 1\n", flow->id,
-                    reader::labelValue(flow->mediaType), flow->continuous ? "samples" : "grains");
-            }
+            buffer.resize(size);
         }
-        out += "# HELP mxl_reader_flow_state 1 for the state the flow's reader is in.\n"
-               "# TYPE mxl_reader_flow_state gauge\n";
-        for (auto const& flow : flows)
-        {
-            out += fmt::format("mxl_reader_flow_state{{flow=\"{}\",state=\"{}\"}} 1\n", flow->id, stateName(flow->state));
-        }
-        out += "# HELP mxl_reader_flow_delivering 1 while reads land within a second.\n"
-               "# TYPE mxl_reader_flow_delivering gauge\n";
-        for (auto const& flow : flows)
-        {
-            out += fmt::format("mxl_reader_flow_delivering{{flow=\"{}\"}} {}\n", flow->id, delivering(*flow) ? 1 : 0);
-        }
-        out += "# HELP mxl_reader_reads_total Reads by outcome, in grains (discrete) or samples (continuous); "
-               "too_early and too_late count events.\n"
-               "# TYPE mxl_reader_reads_total counter\n";
-        for (auto const& flow : flows)
-        {
-            for (auto const& c : ReadResults)
-            {
-                out += fmt::format("mxl_reader_reads_total{{flow=\"{}\",result=\"{}\"}} {}\n", flow->id, c.key, ((*flow).*c.field).load());
-            }
-        }
-        out += "# HELP mxl_reader_open_failures_total Attempts to reach a flow that failed, by reason.\n"
-               "# TYPE mxl_reader_open_failures_total counter\n";
-        for (auto const& flow : flows)
-        {
-            for (auto const& c : OpenFailures)
-            {
-                out += fmt::format("mxl_reader_open_failures_total{{flow=\"{}\",reason=\"{}\"}} {}\n", flow->id, c.key, ((*flow).*c.field).load());
-            }
-        }
-        for (auto const& s : Singles)
-        {
-            out += fmt::format("# HELP {} {}\n# TYPE {} counter\n", s.name, s.help, s.name);
-            for (auto const& flow : flows)
-            {
-                out += fmt::format("{}{{flow=\"{}\"}} {}\n", s.name, flow->id, ((*flow).*s.field).load());
-            }
-        }
-        out += "# HELP mxl_reader_age_seconds Wall clock minus the media timestamp of the last read.\n"
-               "# TYPE mxl_reader_age_seconds gauge\n";
-        for (auto const& flow : flows)
-        {
-            if (flow->lastReadAt != 0)
-            {
-                out += fmt::format("mxl_reader_age_seconds{{flow=\"{}\"}} {:.6f}\n", flow->id, flow->ageNs / 1e9);
-            }
-        }
-        return out;
+        return buffer.empty() ? std::string{} : std::string{buffer.data()};
     }
 
     // The same counts as /metrics, shaped for a page: one object per flow with
     // its state, what it declares, and its last error.
-    std::string status(std::vector<std::unique_ptr<FlowStats>> const& flows)
+    std::string status(std::vector<std::unique_ptr<FlowStats>> const& flows, mxlMonitoring monitoring)
     {
         auto const now = mxlGetTime();
+        auto const counts = snapshots(monitoring);
         std::string out = fmt::format("{{\"version\":{},\"flows\":[", jsonString(versionText()));
-        for (std::size_t i = 0; i < flows.size(); ++i)
+        for (std::size_t i = 0; i < flows.size() && i < counts.size(); ++i)
         {
             auto const& flow = *flows[i];
+            auto const& s = counts[i];
             auto const lock = std::lock_guard{flow.mutex};
             out += i ? "," : "";
             out += fmt::format("{{\"id\":{},\"flowId\":{},\"state\":\"{}\",\"delivering\":{},\"unit\":{},\"mediaType\":{},"
                                "\"format\":{},\"formatMismatch\":{},\"ageSeconds\":{},",
-                jsonString(flow.id), jsonString(flow.target), stateName(flow.state), delivering(flow) ? "true" : "false",
-                flow.opens == 0 ? "null" : flow.continuous ? "\"samples\"" : "\"grains\"", jsonString(flow.mediaType),
-                jsonString(flow.format),
-                jsonString(flow.formatMismatch),
-                flow.lastReadAt ? fmt::format("{:.6f}", flow.ageNs / 1e9) : std::string{"null"});
+                jsonString(flow.id), jsonString(flow.target), mxlMonitoringAccessName(s.access), s.delivering ? "true" : "false",
+                s.opens == 0 ? "null" : flow.continuous ? "\"samples\"" : "\"grains\"",
+                jsonString(s.mediaType), jsonString(flow.format), jsonString(s.formatMismatch),
+                s.lastDataTimeNs ? fmt::format("{:.6f}", static_cast<double>(s.ageNs) / 1e9) : std::string{"null"});
             out += "\"reads\":{";
             for (std::size_t c = 0; c < std::size(ReadResults); ++c)
             {
-                out += fmt::format("{}\"{}\":{}", c ? "," : "", ReadResults[c].key, (flow.*ReadResults[c].field).load());
+                out += fmt::format("{}\"{}\":{}", c ? "," : "", ReadResults[c].key, ReadResults[c].value(s));
             }
             out += "},\"openFailures\":{";
             for (std::size_t c = 0; c < std::size(OpenFailures); ++c)
             {
-                out += fmt::format("{}\"{}\":{}", c ? "," : "", OpenFailures[c].key, (flow.*OpenFailures[c].field).load());
+                out += fmt::format("{}\"{}\":{}", c ? "," : "", OpenFailures[c].key, OpenFailures[c].value(s));
             }
             out += "}";
-            for (auto const& s : Singles)
+            for (auto const& single : Singles)
             {
-                out += fmt::format(",\"{}\":{}", s.key, (flow.*s.field).load());
+                out += fmt::format(",\"{}\":{}", single.key, single.value(s));
             }
             out += flow.lastErrorAt ? fmt::format(",\"lastError\":{{\"message\":{},\"secondsAgo\":{:.1f}}}}}", jsonString(flow.lastError),
                                           (now - flow.lastErrorAt) / 1e9)
@@ -951,7 +792,7 @@ namespace
             out += fmt::format("{}{{\"id\":{},\"label\":{},\"unit\":\"{}\",\"state\":\"{}\",\"ring\":{},\"slotBytes\":{},\"periodMs\":{:.4f},"
                                "\"graceMs\":{:.3f},\"reader\":{},\"head\":{},\"ev\":[",
                 i ? "," : "", jsonString(flow.id), jsonString(flow.format), flow.continuous ? "samples" : "grains",
-                stateName(flow.state), flow.ringLength.load(), flow.slotBytes.load(), ms(static_cast<std::int64_t>(flow.periodNs.load())),
+                mxlMonitoringAccessName(mxlMonitoringGetFlowAccess(flow.monitor)), flow.ringLength.load(), flow.slotBytes.load(), ms(static_cast<std::int64_t>(flow.periodNs.load())),
                 ms(static_cast<std::int64_t>(flow.graceNs.load())), flow.readerIndex.load(), flow.headSeen.load());
             auto first = true;
             for (auto const& e : flow.events)
@@ -1027,7 +868,7 @@ namespace
         return "Internal Server Error";
     }
 
-    void serve(int port, std::vector<std::unique_ptr<FlowStats>> const& flows, reader::nmos::Node* node)
+    void serve(int port, std::vector<std::unique_ptr<FlowStats>> const& flows, mxlMonitoring monitoring, reader::nmos::Node* node)
     {
         auto const fd = ::socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0)
@@ -1100,20 +941,20 @@ namespace
             }
             else if (path == "/metrics")
             {
-                body = metrics(flows);
+                body = metrics(monitoring);
             }
             else if (path == "/status")
             {
-                body = status(flows);
+                body = status(flows, monitoring);
                 type = "application/json";
             }
             else if (path == "/delivering")
             {
                 // A slot no flow is connected to reads nothing on purpose.
                 auto all = true;
-                for (auto const& flow : flows)
+                for (auto const& s : snapshots(monitoring))
                 {
-                    all = all && (flow->state == State::Disconnected || delivering(*flow));
+                    all = all && (s.access == MXL_MONITORING_ACCESS_DISCONNECTED || s.delivering);
                 }
                 code = all ? 200 : 503;
                 body = all ? "delivering\n" : "not every flow is delivering\n";
@@ -1345,15 +1186,32 @@ int main(int argc, char** argv)
     std::fprintf(stderr, "%s, reading %zu flow%s from %s, serving on :%d\n", versionText().c_str(), slots.size(),
         slots.size() == 1 ? "" : "s", domain.c_str(), port);
 
+    auto monitoring = mxlMonitoring{};
+    if (mxlMonitoringCreate(nullptr, &monitoring) != MXL_STATUS_OK)
+    {
+        std::fprintf(stderr, "cannot set up monitoring\n");
+        return 1;
+    }
     auto flows = std::vector<std::unique_ptr<FlowStats>>{};
     for (auto const& slot : slots)
     {
         flows.push_back(std::make_unique<FlowStats>());
-        flows.back()->id = slot.key;
-        flows.back()->target = slot.flow;
+        auto& stats = *flows.back();
+        stats.id = slot.key;
+        stats.target = slot.flow;
+        if (auto const status = mxlMonitoringAddFlow(monitoring, slot.key.c_str(), MXL_MONITORING_ROLE_READER, &stats.monitor);
+            status != MXL_STATUS_OK)
+        {
+            std::fprintf(stderr, "cannot monitor %s: status %d\n", slot.key.c_str(), static_cast<int>(status));
+            return 1;
+        }
+        // Before any thread records; the reader thread retargets it later.
+        mxlMonitoringSetFlowTarget(stats.monitor, slot.flow.c_str());
         if (auto const it = expectations.find(slot.key); it != expectations.end())
         {
-            flows.back()->expected = it->second;
+            stats.expected = it->second;
+            auto const expected = reader::toMonitoring(it->second);
+            mxlMonitoringSetExpectation(stats.monitor, &expected);
         }
     }
 
@@ -1398,7 +1256,7 @@ int main(int argc, char** argv)
     {
         threads.emplace_back(readFlow, domain, std::ref(*flow));
     }
-    threads.emplace_back(serve, port, std::cref(flows), node.get());
+    threads.emplace_back(serve, port, std::cref(flows), monitoring, node.get());
     if (node && !registryHost.empty())
     {
         threads.emplace_back(registerNode, std::ref(*node), registryHost, registryPort);
@@ -1414,19 +1272,22 @@ int main(int argc, char** argv)
             continue;
         }
         waited = 0;
-        for (std::size_t i = 0; i < flows.size(); ++i)
+        auto const counts = snapshots(monitoring);
+        for (std::size_t i = 0; i < flows.size() && i < counts.size(); ++i)
         {
-            auto const& flow = *flows[i];
-            auto const ok = flow.ok.load();
+            auto const& s = counts[i];
+            auto const ok = s.reads[MXL_MONITORING_READ_OK];
+            auto const wrong = s.content[MXL_MONITORING_CONTENT_WRONG_SIZE] + s.content[MXL_MONITORING_CONTENT_WRONG_FORMAT] +
+                               s.content[MXL_MONITORING_CONTENT_WRONG_RESOLUTION] + s.content[MXL_MONITORING_CONTENT_WRONG_RATE];
             std::fprintf(stderr,
                 "flow %s: %s, %.1f %s/s ok, early %llu, late %llu, invalid %llu, wrong %llu, illegal %llu, stalls %llu, age %.3f s\n",
-                flow.id.c_str(), delivering(flow) ? "delivering" : stateName(flow.state),
-                static_cast<double>(ok - previous[i]) / reportSeconds, flow.continuous ? "samples" : "grains",
-                static_cast<unsigned long long>(flow.tooEarly.load()), static_cast<unsigned long long>(flow.tooLate.load()),
-                static_cast<unsigned long long>(flow.invalid.load()),
-                static_cast<unsigned long long>(flow.wrongSize.load() + flow.wrongFormat.load()),
-                static_cast<unsigned long long>(flow.illegal.load()), static_cast<unsigned long long>(flow.stalls.load()),
-                flow.ageNs / 1e9);
+                flows[i]->id.c_str(), s.delivering ? "delivering" : mxlMonitoringAccessName(s.access),
+                static_cast<double>(ok - previous[i]) / reportSeconds, flows[i]->continuous ? "samples" : "grains",
+                static_cast<unsigned long long>(s.reads[MXL_MONITORING_READ_TOO_EARLY]),
+                static_cast<unsigned long long>(s.reads[MXL_MONITORING_READ_TOO_LATE]),
+                static_cast<unsigned long long>(s.content[MXL_MONITORING_CONTENT_INVALID]), static_cast<unsigned long long>(wrong),
+                static_cast<unsigned long long>(s.content[MXL_MONITORING_CONTENT_ILLEGAL_VALUES]), static_cast<unsigned long long>(s.stalls),
+                static_cast<double>(s.ageNs) / 1e9);
             previous[i] = ok;
         }
     }
@@ -1434,6 +1295,16 @@ int main(int argc, char** argv)
     for (auto& thread : threads)
     {
         thread.join();
+    }
+    // Ring views run on detached threads that read the monitoring; each
+    // sees stopping within a batch, and is given a second to.
+    for (auto waited = 0; streams > 0 && waited < 20; ++waited)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    }
+    if (streams == 0)
+    {
+        mxlMonitoringDestroy(monitoring);
     }
     return failed ? 1 : 0;
 }
