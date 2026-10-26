@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.0.0-rc.7](https://github.com/marquies/dmf-mf-mxl-reader/compare/v1.0.0-rc.6...v1.0.0-rc.7) (2026-10-26)
+
+
+### Features
+
+* count and check every read with libmxl-monitoring ([e0fdffd](https://github.com/marquies/dmf-mf-mxl-reader/commit/e0fdffd01abb694bf985b3f08733be6ed6d87fbd))
+* count and check every read with libmxl-monitoring ([9c056ac](https://github.com/marquies/dmf-mf-mxl-reader/commit/9c056ace0dc5ae120227819e4dfc886868ca22cb))
+
+
+### Build System
+
+* pin libmxl-monitoring 0.2.0 by commit ([ca6e5d5](https://github.com/marquies/dmf-mf-mxl-reader/commit/ca6e5d5397e077e503b6bacc6cd233acfaf4f633))
+
 ## [1.0.0-rc.6](https://github.com/marquies/dmf-mf-mxl-reader/compare/v1.0.0-rc.5...v1.0.0-rc.6) (2026-10-22)
 
 
