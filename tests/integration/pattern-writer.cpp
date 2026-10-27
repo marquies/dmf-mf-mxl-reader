@@ -1,8 +1,9 @@
 // A writer for integration-test.py: keeps a video and an audio flow written at
 // the media clock and, on command, writes the faults a reader has to tell
 // apart. One command per line on stdin; each answers "done" on stdout once
-// what it describes has been written, or "skipped" for a fault while the flows
-// are removed. Writing goes on between commands.
+// what it describes has been written, "skipped" for a fault while the flows
+// are removed, or "unknown" for a command it does not know. Writing goes on
+// between commands.
 //
 //   pause <seconds>     write nothing, the flows stay
 //   invalid <n>         the next n grains flagged MXL_GRAIN_FLAG_INVALID
@@ -311,7 +312,8 @@ int main(int argc, char** argv)
             else
             {
                 std::cerr << "pattern-writer: unknown command " << command << "\n";
-                ok = false;
+                busy = false;
+                std::cout << "unknown" << std::endl;
             }
         }
         mxlSleepForNs(2'000'000);
