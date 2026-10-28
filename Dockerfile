@@ -16,8 +16,8 @@ ARG MXL_REF=c259243931333497e61faabeedac8048915dcb2b
 # into the same tree and linked statically. Checked out by commit, which a
 # moved tag cannot change; the tag names the release it is.
 # renovate: datasource=github-tags depName=marquies/libmxl-monitoring
-ARG MONITORING_TAG=v0.2.0
-ARG MONITORING_REF=c034ebf78a97a0d65e217021bff1ad693c9639c3
+ARG MONITORING_TAG=v0.3.0
+ARG MONITORING_REF=440adb949c7c0b45f77e93216a8d3a299522714a
 
 FROM ghcr.io/qvest-digital/go-mxl-builder:${GO_MXL_TAG} AS build
 ARG MXL_REF
