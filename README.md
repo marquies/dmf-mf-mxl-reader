@@ -158,7 +158,9 @@ size, a writer pausing within and beyond the ring, a frozen reader, a flow not
 there yet, a removed flow, a flow the reader may not open, and a flow declaring
 other than `--expect` states. A part-written grain and a writer's gap both read
 as `invalid`, since libmxl marks them so; `missing` and `incomplete` are left to
-the libmxl-monitoring tests. The permission test runs the reader as `nobody`
+the libmxl-monitoring tests. One test runs the writer with `--metrics-port`,
+where it serves its own `mxl_writer_writes_total` through libmxl-monitoring,
+and checks that grains flagged invalid are no ok writes. The permission test runs the reader as `nobody`
 and is skipped unless the suite runs as root, as it does in the image build.
 `permission_error` on a read is not covered: libmxl returns no permission status
 from a read.

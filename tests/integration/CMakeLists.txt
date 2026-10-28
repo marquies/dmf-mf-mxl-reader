@@ -13,5 +13,7 @@ endif ()
 target_link_libraries(mxl-pattern-writer
         PRIVATE
             mxl
+            mxl-monitoring
+            mxl-monitoring-http
             CLI11::CLI11
     )

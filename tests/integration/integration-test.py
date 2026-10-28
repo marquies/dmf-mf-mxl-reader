@@ -91,9 +91,10 @@ class ReaderTest(unittest.TestCase):
         shutil.rmtree(self.domain, ignore_errors=True)
         shutil.rmtree(self.defs, ignore_errors=True)
 
-    def start_writer(self):
+    def start_writer(self, *options):
         self.writer = subprocess.Popen(
-            [WRITER, "-d", self.domain, "-v", os.path.join(self.defs, "video.json"), "-a", os.path.join(self.defs, "audio.json")],
+            [WRITER, "-d", self.domain, "-v", os.path.join(self.defs, "video.json"), "-a", os.path.join(self.defs, "audio.json"),
+             *options],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.assertEqual(self.writer.stdout.readline().strip(), "ready")
 
@@ -199,6 +200,32 @@ class Writing(ReaderTest):
         d = self.delta(before, self.flow(VIDEO))
         self.assertCount(d, "wrong_size", 2)
         self.assertOnly(d, {"wrong_size"}, VIDEO)
+
+
+class WriterMetrics(ReaderTest):
+    def start_writer(self):
+        self.metrics_port = free_port()
+        super().start_writer("--metrics-port", str(self.metrics_port))
+
+    # The writer's mxl_writer_writes_total of one flow, by result.
+    def writes(self, flow):
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.metrics_port}/metrics", timeout=2) as r:
+            prefix = 'mxl_writer_writes_total{flow="%s",result="' % flow
+            return {line[len(prefix):line.index('"', len(prefix))]: float(line.split()[-1])
+                    for line in r.read().decode().splitlines() if line.startswith(prefix)}
+
+    def test_the_writer_counts_ok_only_what_reads_ok(self):
+        writes, reads = self.writes(VIDEO), self.flow(VIDEO)
+        self.command("invalid 5")
+        time.sleep(1)
+        writes_after, reads_after = self.writes(VIDEO), self.flow(VIDEO)
+        d = self.delta(reads, reads_after)
+        self.assertCount(d, "invalid", 5)
+        # A grain flagged invalid is no ok write. The two snapshots are taken
+        # a moment apart, which two grains cover; five miscounted would not be.
+        ok = writes_after["ok"] - writes["ok"]
+        self.assertTrue(d["ok"] - 2 <= ok <= d["ok"] + 2, f"writer ok {ok}, reader ok {d['ok']}")
+        self.assertGreater(self.writes(AUDIO)["ok"], 0)
 
 
 class Gaps(ReaderTest):

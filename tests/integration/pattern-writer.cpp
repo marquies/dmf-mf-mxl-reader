@@ -15,6 +15,10 @@
 //   create              create the writers again, unless they are there
 //   quit
 //
+// With --metrics-port the writes are counted through libmxl-monitoring and
+// served as Prometheus text at /metrics: a grain flagged invalid or written
+// in part counts nothing, as the writer wrappers count it.
+//
 // A grain is written as mxl-gst-testsrc writes one: the header libmxl hands
 // out is kept and only validSlices set, so whatever libmxl leaves in it, such
 // as an earlier grain's invalid flag, reaches the reader. The size is the
@@ -34,6 +38,10 @@
 #include <mxl/flow.h>
 #include <mxl/mxl.h>
 #include <mxl/time.h>
+#include <mxl-monitoring/http.h>
+#include <mxl-monitoring/monitoring.h>
+#include <mxl-monitoring/reader.h>
+#include <mxl-monitoring/writer.h>
 
 namespace
 {
@@ -54,12 +62,26 @@ namespace
         return text.str();
     }
 
+    // The "id" of a flow definition.
+    std::string flowId(std::string const& definition)
+    {
+        auto const key = definition.find("\"id\"");
+        auto const open = definition.find('"', definition.find(':', key) + 1);
+        auto const close = definition.find('"', open + 1);
+        return key == std::string::npos || open == std::string::npos || close == std::string::npos ? std::string{}
+                                                                                                   : definition.substr(open + 1, close - open - 1);
+    }
+
     struct Writer
     {
         std::string domain;
         std::string videoDef;
         std::string audioDef;
-        mxlInstance instance = nullptr;
+        // One instance per flow, so each flow's monitoring knows its domain.
+        mxlInstance videoInstance = nullptr;
+        mxlInstance audioInstance = nullptr;
+        mxlMonitoringFlow videoFlow = nullptr;
+        mxlMonitoringFlow audioFlow = nullptr;
         mxlFlowWriter video = nullptr;
         mxlFlowWriter audio = nullptr;
         mxlRational videoRate{};
@@ -72,17 +94,17 @@ namespace
         bool create()
         {
             auto config = mxlFlowConfigInfo{};
-            if (mxlCreateFlowWriter(instance, videoDef.c_str(), "", &video, &config, nullptr) != MXL_STATUS_OK)
+            if (mxlMonitoringCreateFlowWriter(videoFlow, videoInstance, videoDef.c_str(), "", &video, &config, nullptr) != MXL_STATUS_OK)
             {
                 return false;
             }
             videoRate = config.common.grainRate;
             nextGrain = mxlGetCurrentIndex(&videoRate);
             grainSize = 0;
-            if (mxlCreateFlowWriter(instance, audioDef.c_str(), "", &audio, &config, nullptr) != MXL_STATUS_OK)
+            if (mxlMonitoringCreateFlowWriter(audioFlow, audioInstance, audioDef.c_str(), "", &audio, &config, nullptr) != MXL_STATUS_OK)
             {
                 // Both flows or neither.
-                mxlReleaseFlowWriter(instance, video);
+                mxlReleaseFlowWriter(videoInstance, video);
                 video = nullptr;
                 return false;
             }
@@ -93,8 +115,8 @@ namespace
 
         void release()
         {
-            mxlReleaseFlowWriter(instance, video);
-            mxlReleaseFlowWriter(instance, audio);
+            mxlReleaseFlowWriter(videoInstance, video);
+            mxlReleaseFlowWriter(audioInstance, audio);
             video = audio = nullptr;
         }
 
@@ -102,7 +124,7 @@ namespace
         {
             auto info = mxlGrainInfo{};
             std::uint8_t* payload = nullptr;
-            if (mxlFlowWriterOpenGrain(video, index, &info, &payload) != MXL_STATUS_OK)
+            if (mxlMonitoringFlowWriterOpenGrain(videoFlow, video, index, &info, &payload) != MXL_STATUS_OK)
             {
                 return false;
             }
@@ -132,7 +154,7 @@ namespace
                     break;
                 default:             info.validSlices = info.totalSlices; break;
             }
-            return mxlFlowWriterCommitGrain(video, &info) == MXL_STATUS_OK;
+            return mxlMonitoringFlowWriterCommitGrain(videoFlow, video, &info) == MXL_STATUS_OK;
         }
 
         bool writeSamples(std::uint64_t to)
@@ -143,7 +165,7 @@ namespace
             {
                 auto const count = std::min<std::uint64_t>(to - samplesTo, maxLength);
                 auto slices = mxlMutableWrappedMultiBufferSlice{};
-                if (mxlFlowWriterOpenSamples(audio, samplesTo + count, count, &slices) != MXL_STATUS_OK)
+                if (mxlMonitoringFlowWriterOpenSamples(audioFlow, audio, samplesTo + count, count, &slices) != MXL_STATUS_OK)
                 {
                     return false;
                 }
@@ -157,7 +179,7 @@ namespace
                         }
                     }
                 }
-                if (mxlFlowWriterCommitSamples(audio) != MXL_STATUS_OK)
+                if (mxlMonitoringFlowWriterCommitSamples(audioFlow, audio) != MXL_STATUS_OK)
                 {
                     return false;
                 }
@@ -199,12 +221,29 @@ int main(int argc, char** argv)
     app.add_option("-d,--domain", writer.domain, "The MXL domain directory.")->required();
     app.add_option("-v,--video", videoPath, "Video flow definition.")->required();
     app.add_option("-a,--audio", audioPath, "Audio flow definition.")->required();
+    auto metricsPort = std::uint16_t{};
+    auto metricsPortOpt = app.add_option("--metrics-port", metricsPort, "Port to serve the writes' counts on; none without it.");
     CLI11_PARSE(app, argc, argv);
 
     writer.videoDef = readFile(videoPath);
     writer.audioDef = readFile(audioPath);
-    writer.instance = mxlCreateInstance(writer.domain.c_str(), "");
-    if (writer.instance == nullptr || !writer.create())
+    auto monitoring = mxlMonitoring{};
+    auto metrics = mxlMonitoringHttp{};
+    if (mxlMonitoringCreate(nullptr, &monitoring) != MXL_STATUS_OK ||
+        mxlMonitoringAddFlow(monitoring, flowId(writer.videoDef).c_str(), MXL_MONITORING_ROLE_WRITER, &writer.videoFlow) != MXL_STATUS_OK ||
+        mxlMonitoringAddFlow(monitoring, flowId(writer.audioDef).c_str(), MXL_MONITORING_ROLE_WRITER, &writer.audioFlow) != MXL_STATUS_OK)
+    {
+        std::cerr << "pattern-writer: cannot monitor the flows\n";
+        return 1;
+    }
+    if (metricsPortOpt->count() > 0 && mxlMonitoringHttpStart(monitoring, nullptr, metricsPort, &metrics) != MXL_STATUS_OK)
+    {
+        std::cerr << "pattern-writer: cannot serve metrics on port " << metricsPort << "\n";
+        return 1;
+    }
+    writer.videoInstance = mxlMonitoringCreateInstance(writer.videoFlow, writer.domain.c_str(), "");
+    writer.audioInstance = mxlMonitoringCreateInstance(writer.audioFlow, writer.domain.c_str(), "");
+    if (writer.videoInstance == nullptr || writer.audioInstance == nullptr || !writer.create())
     {
         std::cerr << "pattern-writer: cannot create the flows in " << writer.domain << "\n";
         return 1;
@@ -320,6 +359,12 @@ int main(int argc, char** argv)
     {
         writer.release();
     }
-    mxlDestroyInstance(writer.instance);
+    mxlDestroyInstance(writer.videoInstance);
+    mxlDestroyInstance(writer.audioInstance);
+    if (metrics != nullptr)
+    {
+        mxlMonitoringHttpStop(metrics);
+    }
+    mxlMonitoringDestroy(monitoring);
     return ok ? 0 : 1;
 }
