@@ -902,14 +902,17 @@ namespace
             {
                 continue;
             }
-            auto const request = reader::parseRequest(reader::readRequest(client, RequestBudget));
-            // The NMOS APIs take GET and PATCH; everything else here is read.
+            auto request = reader::parseRequest(reader::readRequest(client, RequestBudget));
+            request.path = reader::collapseSlashes(request.path);
+            // The NMOS APIs take GET and PATCH, and OPTIONS from a browser
+            // before a PATCH; everything else here is read.
             if (node != nullptr && request.path.starts_with("/x-nmos/"))
             {
-                auto const reply = node->handle(request.method, request.path, request.body);
-                auto const response = fmt::format("HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n"
+                auto const preflight = request.method == "OPTIONS";
+                auto const reply = preflight ? reader::nmos::Reply{.code = 200, .body = ""} : node->handle(request.method, request.path, request.body);
+                auto const response = fmt::format("HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n{}"
                                                   "Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    reply.code, reason(reply.code), reply.body.size(), reply.body);
+                    reply.code, reason(reply.code), reader::corsHeaders(preflight), reply.body.size(), reply.body);
                 reader::sendAll(client, response, RequestBudget);
                 ::close(client);
                 continue;

@@ -193,6 +193,20 @@ namespace
         check(sentFor < std::chrono::milliseconds{900}, "an answer nobody reads is given up after its budget");
         ::close(pair.server);
     }
+
+    void nmosHttp()
+    {
+        check(reader::collapseSlashes("/x-nmos/connection/v1.1//single/receivers/") == "/x-nmos/connection/v1.1/single/receivers/",
+            "an href ending in '/' joined with '/single' reaches the Connection API");
+        check(reader::collapseSlashes("//x-nmos///node/v1.3") == "/x-nmos/node/v1.3", "every run of slashes becomes one");
+        check(reader::collapseSlashes("/metrics") == "/metrics", "a path without doubled slashes is kept");
+        check(reader::corsHeaders(false) == "Access-Control-Allow-Origin: *\r\n", "every NMOS response lets a page of any origin read it");
+        auto const preflight = reader::corsHeaders(true);
+        check(preflight.find("Access-Control-Allow-Origin: *\r\n") != std::string::npos
+                && preflight.find("Access-Control-Allow-Methods: GET, PATCH, OPTIONS\r\n") != std::string::npos
+                && preflight.find("Access-Control-Allow-Headers: Content-Type") != std::string::npos,
+            "a preflight allows the PATCH and the JSON body a controller sends");
+    }
 }
 
 int main()
@@ -201,6 +215,7 @@ int main()
     conversion();
     longRequest();
     stalledClients();
+    nmosHttp();
     if (failures == 0)
     {
         std::fprintf(stderr, "all checks pass\n");
