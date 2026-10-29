@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.0.0-rc.9](https://github.com/marquies/dmf-mf-mxl-reader/compare/v1.0.0-rc.8...v1.0.0-rc.9) (2026-10-29)
+
+
+### Features
+
+* push the counts and events over OTLP ([#20](https://github.com/marquies/dmf-mf-mxl-reader/issues/20)) ([33edee5](https://github.com/marquies/dmf-mf-mxl-reader/commit/33edee5229c2a6356b2efc2950140f9e1a610cab))
+
+
+### Bug Fixes
+
+* **deps:** move onto libmxl-monitoring 0.3.0 ([#18](https://github.com/marquies/dmf-mf-mxl-reader/issues/18)) ([08ec5ba](https://github.com/marquies/dmf-mf-mxl-reader/commit/08ec5ba77cbef2cae8bd03c2d450c684845b70ed))
+* **nmos:** let browser controllers reach the NMOS APIs ([#21](https://github.com/marquies/dmf-mf-mxl-reader/issues/21)) ([c67a6b0](https://github.com/marquies/dmf-mf-mxl-reader/commit/c67a6b07950be47a47d697bdeb29af2cd976ed60))
+
 ## [1.0.0-rc.8](https://github.com/marquies/dmf-mf-mxl-reader/compare/v1.0.0-rc.7...v1.0.0-rc.8) (2026-10-26)
 
 
