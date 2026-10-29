@@ -100,10 +100,14 @@ class ReaderTest(unittest.TestCase):
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.assertEqual(self.writer.stdout.readline().strip(), "ready")
 
+    flows = (VIDEO, AUDIO)
+    options = ()
+
     def start_reader(self, user=None, env=None):
+        flows = [arg for flow in self.flows for arg in ("-f", flow)]
         self.reader = subprocess.Popen(
-            [READER, "-d", self.domain, "-f", VIDEO, "-f", AUDIO, "--expect", json.dumps(self.expect),
-             "-p", str(self.port), "--report-interval", "0"],
+            [READER, "-d", self.domain, *flows, "--expect", json.dumps(self.expect),
+             "-p", str(self.port), "--report-interval", "0", *self.options],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, user=user, env={**os.environ, **(env or {})})
         self.wait_for(self.serving, "the reader serving /status")
 
@@ -375,6 +379,41 @@ class Otlp(ReaderTest):
         # which only a polling reader raises.
         self.wait_for(lambda: {"mxl.flow.open_failed", "mxl.flow.opened"} <= {r.get("eventName") for r in self.records()},
                       "open_failed and opened log records")
+
+
+# The reader as an NMOS Node, reached the way a controller running in a
+# browser reaches it, such as a registry's web UI on another origin.
+class NmosHttp(ReaderTest):
+    writer_first = False
+    flows = (f"monitor:video={VIDEO}", f"monitor:audio={AUDIO}")
+    expect = {"monitor:video": EXPECT[VIDEO], "monitor:audio": EXPECT[AUDIO]}
+    options = ("--nmos-seed", "integration-test", "--nmos-host", "127.0.0.1")
+
+    def nmos(self, method, path, body=None, headers=None):
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", method=method,
+                                         data=None if body is None else json.dumps(body).encode(),
+                                         headers={"Origin": "http://registry.example", **(headers or {})})
+        with urllib.request.urlopen(request, timeout=2) as r:
+            return r.status, r.headers, r.read()
+
+    def test_a_browser_controller_reaches_the_connection_api(self):
+        self.start_reader()
+        _, headers, body = self.nmos("GET", "/x-nmos/node/v1.3/devices/")
+        self.assertEqual(headers["Access-Control-Allow-Origin"], "*")
+        control = json.loads(body)[0]["controls"][0]["href"]
+        # A client joining the registered href with a path of its own.
+        status, headers, body = self.nmos("GET", control.split(str(self.port), 1)[1] + "/single/receivers/")
+        self.assertEqual((status, headers["Access-Control-Allow-Origin"]), (200, "*"))
+        receiver = json.loads(body)[0].rstrip("/")
+        staged = f"/x-nmos/connection/v1.1/single/receivers/{receiver}/staged"
+        status, headers, _ = self.nmos("OPTIONS", staged, headers={
+            "Access-Control-Request-Method": "PATCH", "Access-Control-Request-Headers": "content-type"})
+        self.assertEqual(status, 200)
+        self.assertIn("PATCH", headers["Access-Control-Allow-Methods"])
+        self.assertIn("content-type", headers["Access-Control-Allow-Headers"].lower())
+        status, headers, _ = self.nmos("PATCH", staged, {"master_enable": False, "activation": {"mode": "activate_immediate"}},
+                                       {"Content-Type": "application/json"})
+        self.assertEqual((status, headers["Access-Control-Allow-Origin"]), (200, "*"))
 
 
 # A reader that is refused a flow, where root would be let in. libmxl reports
