@@ -130,7 +130,10 @@ it, and posts a receiver again when its subscription changes. The node is
 advertised at `--nmos-host` (default: the hostname) and `-p`.
 
 The NMOS APIs are unauthenticated, as IS-04 and IS-05 are: whoever reaches the
-port can move a slot to any flow in the domain.
+port can move a slot to any flow in the domain. Every response carries
+`Access-Control-Allow-Origin: *` and an `OPTIONS` preflight is answered, so a
+controller running in a browser on another origin, such as a registry's web UI,
+reaches them; a run of slashes in a path counts as one.
 
 An id that is not a lowercase flow UUID, or an `--expect` that is unreadable,
 names a flow not read, or a key the reader does not check, exits with status 2, as does a
@@ -160,7 +163,9 @@ other than `--expect` states. A part-written grain and a writer's gap both read
 as `invalid`, since libmxl marks them so; `missing` and `incomplete` are left to
 the libmxl-monitoring tests. One test runs the writer with `--metrics-port`,
 where it serves its own `mxl_writer_writes_total` through libmxl-monitoring,
-and checks that grains flagged invalid are no ok writes. The permission test runs the reader as `nobody`
+and checks that grains flagged invalid are no ok writes. Another starts the
+reader as an NMOS Node and reaches its Connection API as a browser on another
+origin does, preflight included. The permission test runs the reader as `nobody`
 and is skipped unless the suite runs as root, as it does in the image build.
 `permission_error` on a read is not covered: libmxl returns no permission status
 from a read.

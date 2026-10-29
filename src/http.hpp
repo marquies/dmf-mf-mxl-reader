@@ -120,6 +120,32 @@ namespace reader
         return request;
     }
 
+    // The path with every run of slashes made one, so a client joining an href
+    // that ends in '/' with a path that starts with one still reaches it.
+    inline std::string collapseSlashes(std::string_view path)
+    {
+        auto out = std::string{};
+        for (auto const c : path)
+        {
+            if (c != '/' || out.empty() || out.back() != '/')
+            {
+                out.push_back(c);
+            }
+        }
+        return out;
+    }
+
+    // The CORS headers of an NMOS API response, which a controller running in
+    // a browser on another origin, such as a registry's web UI, needs to read
+    // it; with preflight those answering the OPTIONS a browser sends before a
+    // PATCH.
+    inline std::string corsHeaders(bool preflight)
+    {
+        return preflight ? "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, PATCH, OPTIONS\r\n"
+                           "Access-Control-Allow-Headers: Content-Type, Accept\r\nAccess-Control-Max-Age: 86400\r\n"
+                         : "Access-Control-Allow-Origin: *\r\n";
+    }
+
     // A request's method, target without the query, and body.
     struct Request
     {
