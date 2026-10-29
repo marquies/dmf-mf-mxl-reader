@@ -8,7 +8,8 @@ reading at the head shows whether that copy keeps up. The reader is built inside
 a [`dmf-mxl/mxl`](https://github.com/dmf-mxl/mxl) tree against the
 `ghcr.io/qvest-digital/go-mxl-runtime` libmxl, the same pair
 `dmf-mf-mxl-writer` builds against, so reader and writer share one libmxl ABI.
-What it counts and checks of each read, and the `/metrics` text, come from
+What it counts and checks of each read, the `/metrics` text and the OTLP
+export come from
 [`libmxl-monitoring`](https://github.com/marquies/libmxl-monitoring), built
 into the same tree and linked statically.
 
@@ -105,6 +106,12 @@ histograms: `mxl_reader_arrival_seconds`, read time minus media timestamp, and
 `mxl_reader_commit_seconds`, commit time minus media timestamp for grains read
 while they are the head.
 
+With `OTEL_EXPORTER_OTLP_ENDPOINT` set, the same counts are pushed over
+OTLP/HTTP under their OTLP names (`mxl.reader.*`, `mxl.flow.*`), and reads
+and opens failing and recovering as log records. The standard `OTEL_*`
+variables configure it, such as `OTEL_METRIC_EXPORT_INTERVAL` and
+`OTEL_RESOURCE_ATTRIBUTES`; `service.name` is `mxl-reader` unless they set one.
+
 ## NMOS
 
 With `--nmos-seed` the reader is an NMOS Node (IS-04 v1.3, IS-05 v1.1) as AMWA
@@ -162,13 +169,14 @@ there yet, a removed flow, a flow the reader may not open, and a flow declaring
 other than `--expect` states. A part-written grain and a writer's gap both read
 as `invalid`, since libmxl marks them so; `missing` and `incomplete` are left to
 the libmxl-monitoring tests. One test runs the writer with `--metrics-port`,
-where it serves its own `mxl_writer_writes_total` through libmxl-monitoring,
-and checks that grains flagged invalid are no ok writes. Another starts the
-reader as an NMOS Node and reaches its Connection API as a browser on another
-origin does, preflight included. The permission test runs the reader as `nobody`
-and is skipped unless the suite runs as root, as it does in the image build.
-`permission_error` on a read is not covered: libmxl returns no permission status
-from a read.
+where it serves its own `mxl_writer_writes_total` through libmxl-monitoring, and
+checks that grains flagged invalid are no ok writes. Another runs the reader
+against an OTLP receiver in the test and checks the counts and the open events
+arrive there, and one starts the reader as an NMOS Node and reaches its
+Connection API as a browser on another origin does, preflight included. The
+permission test runs the reader as `nobody` and is skipped unless the suite
+runs as root, as it does in the image build. `permission_error` on a read is
+not covered: libmxl returns no permission status from a read.
 
 `GO_MXL_TAG` and `MXL_REF` move together with `dmf-mf-mxl-writer`'s, so the
 reader links the libmxl the writer and the mxl-k8s gateway run.
