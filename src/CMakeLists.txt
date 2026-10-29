@@ -26,12 +26,13 @@ if (NOT TARGET picojson::picojson)
 endif ()
 
 # libmxl-monitoring, added to the same tree by the image build, counts and
-# checks every read and renders /metrics.
+# checks every read, renders /metrics and pushes OTLP.
 target_link_libraries(mxl-reader
         PRIVATE
             mxl
             mxl-monitoring
             mxl-monitoring-prometheus
+            mxl-monitoring-otlp
             CLI11::CLI11
             fmt::fmt
             picojson::picojson

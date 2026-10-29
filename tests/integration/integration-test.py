@@ -15,9 +15,11 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 READER = WRITER = None
 
@@ -98,11 +100,11 @@ class ReaderTest(unittest.TestCase):
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.assertEqual(self.writer.stdout.readline().strip(), "ready")
 
-    def start_reader(self, user=None):
+    def start_reader(self, user=None, env=None):
         self.reader = subprocess.Popen(
             [READER, "-d", self.domain, "-f", VIDEO, "-f", AUDIO, "--expect", json.dumps(self.expect),
              "-p", str(self.port), "--report-interval", "0"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, user=user)
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, user=user, env={**os.environ, **(env or {})})
         self.wait_for(self.serving, "the reader serving /status")
 
     def command(self, line):
@@ -296,6 +298,83 @@ class Access(ReaderTest):
             f = self.flow(flow)
             self.assertEqual(f["lost"], 1, flow)
             self.assertEqual(f["opens"], 2, flow)
+
+
+# An OTLP/HTTP receiver taking JSON, which keeps every body by path.
+class Collector(HTTPServer):
+    def __init__(self):
+        self.bodies = {}
+        self.lock = threading.Lock()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(handler):
+                body = json.loads(handler.rfile.read(int(handler.headers["Content-Length"])))
+                with self.lock:
+                    self.bodies.setdefault(handler.path, []).append(body)
+                handler.send_response(200)
+                handler.send_header("Content-Type", "application/json")
+                handler.send_header("Content-Length", "2")
+                handler.end_headers()
+                handler.wfile.write(b"{}")
+
+            def log_message(handler, *args):
+                pass
+
+        super().__init__(("127.0.0.1", 0), Handler)
+
+    def received(self, path):
+        with self.lock:
+            return list(self.bodies.get(path, []))
+
+
+class Otlp(ReaderTest):
+    writer_first = False
+
+    def setUp(self):
+        super().setUp()
+        self.collector = Collector()
+        threading.Thread(target=self.collector.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        super().tearDown()
+        self.collector.shutdown()
+        self.collector.server_close()
+
+    # Every OTLP log record received, and every data point of the metric
+    # `name` of the video flow, newest last.
+    def records(self):
+        return [r for b in self.collector.received("/v1/logs") for rl in b["resourceLogs"]
+                for sl in rl["scopeLogs"] for r in sl["logRecords"]]
+
+    def video_points(self, name):
+        def flow(p):
+            return any(a["key"] == "mxl.flow.id" and a["value"]["stringValue"] == VIDEO for a in p["attributes"])
+        return [p for b in self.collector.received("/v1/metrics") for rm in b["resourceMetrics"]
+                for sm in rm["scopeMetrics"] for m in sm["metrics"] if m["name"] == name
+                for p in m["sum"]["dataPoints"] if flow(p)]
+
+    def test_counts_and_events_are_pushed_where_a_collector_is_named(self):
+        self.start_reader(env={
+            "OTEL_EXPORTER_OTLP_ENDPOINT": f"http://127.0.0.1:{self.collector.server_port}",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
+            "OTEL_METRIC_EXPORT_INTERVAL": "500",
+            "OTEL_BLRP_SCHEDULE_DELAY": "200",
+        })
+        self.wait_for(lambda: self.flow(VIDEO)["openFailures"]["not_found"] >= 1, "not_found counted")
+        self.start_writer()
+        self.wait_for(lambda: self.flow(VIDEO)["delivering"], "video delivering")
+
+        def ok_reads():
+            return [int(p["asInt"]) for p in self.video_points("mxl.reader.reads")
+                    if {"key": "mxl.read.result", "value": {"stringValue": "ok"}} in p["attributes"]]
+        self.wait_for(lambda: any(n > 0 for n in ok_reads()), "ok reads of the video flow over OTLP")
+        resource = self.collector.received("/v1/metrics")[0]["resourceMetrics"][0]["resource"]["attributes"]
+        self.assertIn({"key": "service.name", "value": {"stringValue": "mxl-reader"}}, resource)
+
+        # The flow missing at the start and found later is an event each way,
+        # which only a polling reader raises.
+        self.wait_for(lambda: {"mxl.flow.open_failed", "mxl.flow.opened"} <= {r.get("eventName") for r in self.records()},
+                      "open_failed and opened log records")
 
 
 # A reader that is refused a flow, where root would be let in. libmxl reports

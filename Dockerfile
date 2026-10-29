@@ -16,8 +16,8 @@ ARG MXL_REF=c259243931333497e61faabeedac8048915dcb2b
 # into the same tree and linked statically. Checked out by commit, which a
 # moved tag cannot change; the tag names the release it is.
 # renovate: datasource=github-tags depName=marquies/libmxl-monitoring
-ARG MONITORING_TAG=v0.3.0
-ARG MONITORING_REF=440adb949c7c0b45f77e93216a8d3a299522714a
+ARG MONITORING_TAG=v0.4.0
+ARG MONITORING_REF=8a3ec560da3773319c788fe2ecd6d838784d1557
 
 FROM ghcr.io/qvest-digital/go-mxl-builder:${GO_MXL_TAG} AS build
 ARG MXL_REF
@@ -25,6 +25,12 @@ ARG MXL_SRC
 ARG MONITORING_REF
 # What the binary reports as its version: the release, or the commit.
 ARG VERSION=dev
+
+# opentelemetry-cpp with its OTLP/HTTP exporter, for libmxl-monitoring's OTLP
+# exporter. go-mxl-builder does not carry it; installed from the image's vcpkg
+# ports in classic mode, in a layer of its own that only a new GO_MXL_TAG
+# rebuilds.
+RUN /root/vcpkg/vcpkg install "opentelemetry-cpp[otlp-http]" --x-install-root=/opt/otel
 
 WORKDIR /src
 # A full clone: GitHub refuses a shallow fetch of an arbitrary commit by SHA.
@@ -45,6 +51,8 @@ RUN cmake -S . -B build \
         -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DMXL_ENABLE_FABRICS_OFI=ON \
+        -DMXL_MONITORING_OTLP=ON \
+        -DCMAKE_PREFIX_PATH=/opt/otel/x64-linux \
         -DCMAKE_TOOLCHAIN_FILE=/root/vcpkg/scripts/buildsystems/vcpkg.cmake \
         -DMXL_READER_VERSION="${VERSION}" \
     && cmake --build build --target mxl-reader mxl-reader-tests mxl-reader-nmos-tests mxl-pattern-writer mxl-info -j \

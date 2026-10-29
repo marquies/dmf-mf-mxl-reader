@@ -32,6 +32,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -45,6 +46,7 @@
 #include <fmt/format.h>
 #include <mxl-monitoring/content.h>
 #include <mxl-monitoring/monitoring.h>
+#include <mxl-monitoring/otlp.h>
 #include <mxl-monitoring/prometheus.h>
 #include <mxl-monitoring/reader.h>
 #include <mxl/flow.h>
@@ -1251,10 +1253,37 @@ int main(int argc, char** argv)
             slots.size() == 1 ? "" : "s", nmosHost.c_str(), port);
     }
 
+    // The counts pushed over OTLP/HTTP as well, with the events a poll thread
+    // raises as log records, where the standard OTEL_* variables name a
+    // collector.
+    auto otlp = mxlMonitoringOtlp{};
+    if (auto const* const endpoint = std::getenv("OTEL_EXPORTER_OTLP_ENDPOINT"); endpoint != nullptr && *endpoint != '\0')
+    {
+        if (mxlMonitoringOtlpStart(monitoring, "mxl-reader", &otlp) != MXL_STATUS_OK)
+        {
+            std::fprintf(stderr, "cannot start the OTLP exporter for %s\n", endpoint);
+            return 1;
+        }
+        std::fprintf(stderr, "otlp: pushing to %s\n", endpoint);
+    }
+
     auto threads = std::vector<std::thread>{};
     for (auto& flow : flows)
     {
         threads.emplace_back(readFlow, domain, std::ref(*flow));
+    }
+    if (otlp != nullptr)
+    {
+        threads.emplace_back(
+            [monitoring]()
+            {
+                // More often than the 1 s after which a condition counts as over.
+                while (!stopping)
+                {
+                    mxlMonitoringPoll(monitoring);
+                    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+                }
+            });
     }
     threads.emplace_back(serve, port, std::cref(flows), monitoring, node.get());
     if (node && !registryHost.empty())
@@ -1295,6 +1324,11 @@ int main(int argc, char** argv)
     for (auto& thread : threads)
     {
         thread.join();
+    }
+    if (otlp != nullptr)
+    {
+        mxlMonitoringPoll(monitoring);
+        mxlMonitoringOtlpStop(otlp);
     }
     // Ring views run on detached threads that read the monitoring; each
     // sees stopping within a batch, and is given a second to.
