@@ -25,7 +25,8 @@ release.
 
 ```
 mxl-reader -d <domain> -f <flow> [-f <flow> ...] [--expect <json>] [-p 9102] [--report-interval 10]
-           [--nmos-seed <seed> [--nmos-registry http://<host>[:<port>]] [--nmos-host <host>] [--nmos-label <label>]]
+           [--nmos-seed <seed> [--nmos-registry http://<host>[:<port>]] [--nmos-host <host>] [--nmos-label <label>]
+                               [--nmos-port 3212] [--nmos-control-port <port>]]
 ```
 
 A `<flow>` is a flow id, or a named slot `<name>:<video|audio|data>[=<flow id>]`
@@ -114,37 +115,57 @@ variables configure it, such as `OTEL_METRIC_EXPORT_INTERVAL` and
 
 ## NMOS
 
-With `--nmos-seed` the reader is an NMOS Node (IS-04 v1.3, IS-05 v1.1) as AMWA
-BCP-007-03 specifies for MXL, served on the same port as the other endpoints.
-Every `-f` is then a named slot, and each slot is an MXL Receiver whose format
-follows its kind and whose BCP-004-01 capabilities follow its `--expect`
-(geometry, rate, sample rate, channels). Receivers are grouped by the
-`urn:x-nmos:tag:grouphint/v1.0` tag `<name>:Video`, `<name>:Audio` or
-`<name>:Data`.
+With `--nmos-seed` the reader is an NMOS Node (IS-04 v1.3, IS-05) as AMWA
+BCP-007-03 specifies for MXL, served by
+[libnvnmos](https://github.com/NVIDIA/nvnmos) over nmos-cpp on `--nmos-port`,
+apart from the reader's own endpoints. Every `-f` is then a named slot, and
+each slot is an MXL Receiver named by its key `<name>:<kind>`, labelled
+`<name> <kind>` and grouped by the `urn:x-nmos:tag:grouphint/v1.0` tag
+`<name>:Video`, `<name>:Audio` or `<name>:Data`. Its format follows its kind.
+Its BCP-004-01 capabilities follow its `--expect` where that names everything
+libnvnmos constrains: width, height and rate for video (with 10-bit 4:2:2
+sampling), sample rate and channels for audio (32-bit), rate for data. A slot
+whose `--expect` leaves any of them open states its media type alone.
 
 A controller connects a slot through the Connection API with a single leg of
-`mxl_domain_id` and `mxl_flow_id`. `auto` for the domain resolves to the id in
-`<domain>/domain_def.json`; another domain is refused, and `mxl_flow_id` takes
-no `auto`. An immediate activation moves the slot's reader to the flow named,
-and `master_enable` false moves it off; a flow that is not there yet is waited
-for, as at start. Scheduled activations answer 501. A slot booked without a
-flow reads nothing and does not count against `/delivering` until connected.
+`mxl_domain_id` and `mxl_flow_id`. The domain is constrained to the id in
+`<domain>/domain_def.json`, which `auto` resolves to; without one the domain
+is unconstrained, and a connection that names a domain reads nothing. An
+activation, immediate or scheduled, moves the slot's reader to the flow
+named, and `master_enable` false, or a null `mxl_flow_id`, moves it off; a
+flow that is not there yet is waited for, as at start. A slot booked without
+a flow reads nothing and does not count against `/delivering` until
+connected.
 
-Resource ids derive from the seed, so they survive restarts. With
-`--nmos-registry` the node registers with that IS-04 Registration API, sends a
-heartbeat every five seconds, registers again when the registry has dropped
-it, and posts a receiver again when its subscription changes. The node is
-advertised at `--nmos-host` (default: the hostname) and `-p`.
+Resource ids derive from the seed and the slot's key, so they survive
+restarts. With `--nmos-registry` the node registers with that IS-04
+Registration API, which it also takes as its IS-09 System API; without it the
+node registers nowhere. It is advertised at `--nmos-host` (default: the
+hostname), and an IPv4 address given there is the only address advertised.
 
-The NMOS APIs are unauthenticated, as IS-04 and IS-05 are: whoever reaches the
-port can move a slot to any flow in the domain. Every response carries
-`Access-Control-Allow-Origin: *` and an `OPTIONS` preflight is answered, so a
-controller running in a browser on another origin, such as a registry's web UI,
-reaches them; a run of slashes in a path counts as one.
+With `--nmos-control-port` the node serves the IS-12 Control Protocol there,
+with an AMWA BCP-008-01 `NcReceiverMonitor` per Receiver, linked to it by a
+touchpoint. Once a second each connected slot's monitor is given the
+statuses its counts decide since the second before, as libmxl-monitoring
+judges them: the link from the MXL domain being available, the connection
+from the flow being open and read without stalls, losses, failed or late
+reads, no external synchronization, and the stream from the content read.
+`GetLostPacketCounters` answers the grains or samples skipped and missing,
+`GetLatePacketCounters` the reads too early past the grace, both since the
+last reset. nmos-cpp applies the reporting delay, counts transitions, derives
+the overall status, and makes a monitor inactive while its Receiver is.
+
+The NMOS APIs are unauthenticated, as IS-04, IS-05 and IS-12 are: whoever
+reaches the ports can move a slot to any flow in the domain. nmos-cpp answers
+every NMOS request with `Access-Control-Allow-Origin: *` and answers an
+`OPTIONS` preflight, so a controller running in a browser on another origin,
+such as a registry's web UI, reaches them.
 
 An id that is not a lowercase flow UUID, or an `--expect` that is unreadable,
-names a flow not read, or a key the reader does not check, exits with status 2, as does a
-slot without a flow, a flow read twice, or an unnamed flow beside `--nmos-seed`; a port that cannot be bound exits with status 1.
+names a flow not read, or a key the reader does not check, exits with status
+2, as does a slot without a flow, a flow read twice, an unnamed flow beside
+`--nmos-seed`, or ports that are not distinct; a port that cannot be bound,
+or an NMOS Node that does not start, exits with status 1.
 
 ## Build locally
 
@@ -152,10 +173,15 @@ slot without a flow, a flow read twice, or an unnamed flow beside `--nmos-seed`;
 docker build -t dmf-mf-mxl-reader:dev .
 ```
 
+libnvnmos comes from `NVNMOS_IMAGE`, and libmxl-monitoring from the commit
+`MONITORING_REF` names; `--build-arg NVNMOS_IMAGE=<image>` takes another
+libnvnmos image and `--build-context monitoring=<directory>` a
+libmxl-monitoring checkout.
+
 The build runs the unit tests in `tests/unittests`: `mxl-reader-tests`, the
 `--expect` handling in `src/checks.hpp` and the request handling in
-`src/http.hpp`, and `mxl-reader-nmos-tests`, the NMOS Node in `src/nmos.hpp`,
-and fails with them. The checks a grain or a
+`src/http.hpp`, and `mxl-reader-nmos-tests`, the slots, Receiver definitions,
+activations and monitor statuses in `src/nmos.hpp`, and fails with them. The checks a grain or a
 batch of samples goes through are tested in libmxl-monitoring, which
 `MONITORING_REF` pins.
 
@@ -172,8 +198,12 @@ the libmxl-monitoring tests. One test runs the writer with `--metrics-port`,
 where it serves its own `mxl_writer_writes_total` through libmxl-monitoring, and
 checks that grains flagged invalid are no ok writes. Another runs the reader
 against an OTLP receiver in the test and checks the counts and the open events
-arrive there, and one starts the reader as an NMOS Node and reaches its
-Connection API as a browser on another origin does, preflight included. The
+arrive there. The NMOS tests start the reader as an NMOS Node with IS-12:
+each Receiver has its monitor at its touchpoint, the connection status turns
+unhealthy while the writer pauses and healthy again after the reporting
+delay, with the skipped grains counted as lost, a disconnect stops the slot
+and makes its monitor inactive, a connection moves it back, and the
+Connection API answers a browser's preflight. The
 permission test runs the reader as `nobody` and is skipped unless the suite
 runs as root, as it does in the image build. `permission_error` on a read is
 not covered: libmxl returns no permission status from a read.
