@@ -25,6 +25,14 @@ if (NOT TARGET picojson::picojson)
     find_package(picojson REQUIRED)
 endif ()
 
+# libnvnmos, NVIDIA's C API over nmos-cpp, serves the NMOS Node: IS-04,
+# IS-05, BCP-007-03 and, patched, IS-12 with BCP-008 monitors. NVNMOS_ROOT is
+# its install prefix, which the image build copies from the libnvnmos image.
+set(NVNMOS_ROOT "/opt/nvnmos" CACHE PATH "libnvnmos install prefix")
+find_path(NVNMOS_INCLUDE_DIR nvnmos.h HINTS "${NVNMOS_ROOT}/include" REQUIRED)
+find_library(NVNMOS_LIBRARY nvnmos HINTS "${NVNMOS_ROOT}/lib" REQUIRED)
+target_include_directories(mxl-reader PRIVATE "${NVNMOS_INCLUDE_DIR}")
+
 # libmxl-monitoring, added to the same tree by the image build, counts and
 # checks every read, renders /metrics and pushes OTLP.
 target_link_libraries(mxl-reader
@@ -36,6 +44,7 @@ target_link_libraries(mxl-reader
             CLI11::CLI11
             fmt::fmt
             picojson::picojson
+            "${NVNMOS_LIBRARY}"
     )
 
 set_target_properties(mxl-reader

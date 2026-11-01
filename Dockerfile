@@ -19,10 +19,31 @@ ARG MXL_REF=c259243931333497e61faabeedac8048915dcb2b
 ARG MONITORING_TAG=v0.4.0
 ARG MONITORING_REF=8a3ec560da3773319c788fe2ecd6d838784d1557
 
+# libnvnmos, NVIDIA's C API over nmos-cpp, serves the NMOS Node, patched with
+# IS-12 and BCP-008 monitors. Its dependencies take the better part of an hour
+# to compile, so it comes prebuilt from the image dmf-mf-mxl-compositor
+# publishes, tagged by the NvNmos commit and the first 8 hex digits of the
+# hash of the patches applied to it. The library links its dependencies
+# statically and needs nothing beyond libc and libstdc++.
+ARG NVNMOS_REF=36fb7db9b5616a26f77164de735c15171e01aaed
+ARG NVNMOS_PATCHES=b020ce30
+ARG NVNMOS_IMAGE=ghcr.io/qvest-digital/dmf-mf-mxl-compositor/nvnmos:${NVNMOS_REF}-${NVNMOS_PATCHES}
+
+FROM ${NVNMOS_IMAGE} AS nvnmos
+
+# The libmxl-monitoring source, as a stage of its own so a local build can
+# take a checkout instead: --build-context monitoring=<directory>.
+FROM ghcr.io/qvest-digital/go-mxl-builder:${GO_MXL_TAG} AS monitoring-clone
+ARG MONITORING_REF
+RUN git clone https://github.com/marquies/libmxl-monitoring.git /libmxl-monitoring \
+ && git -C /libmxl-monitoring checkout "${MONITORING_REF}"
+
+FROM scratch AS monitoring
+COPY --from=monitoring-clone /libmxl-monitoring /
+
 FROM ghcr.io/qvest-digital/go-mxl-builder:${GO_MXL_TAG} AS build
 ARG MXL_REF
 ARG MXL_SRC
-ARG MONITORING_REF
 # What the binary reports as its version: the release, or the commit.
 ARG VERSION=dev
 
@@ -35,9 +56,9 @@ RUN /root/vcpkg/vcpkg install "opentelemetry-cpp[otlp-http]" --x-install-root=/o
 WORKDIR /src
 # A full clone: GitHub refuses a shallow fetch of an arbitrary commit by SHA.
 RUN git clone "${MXL_SRC}" . && git checkout "${MXL_REF}"
-RUN git clone https://github.com/marquies/libmxl-monitoring.git libmxl-monitoring \
- && git -C libmxl-monitoring checkout "${MONITORING_REF}" \
- && echo 'add_subdirectory(libmxl-monitoring)' >> CMakeLists.txt
+COPY --from=monitoring / libmxl-monitoring/
+RUN echo 'add_subdirectory(libmxl-monitoring)' >> CMakeLists.txt
+COPY --from=nvnmos /opt/nvnmos /opt/nvnmos
 
 COPY src/ /src/tools/mxl-reader/
 COPY tests/unittests/ /src/tools/mxl-reader-unittests/
@@ -65,6 +86,7 @@ FROM ghcr.io/qvest-digital/go-mxl-runtime:${GO_MXL_TAG}
 
 COPY --from=build /src/build/tools/mxl-reader/mxl-reader /usr/bin/mxl-reader
 COPY --from=build /src/build/tools/mxl-info/mxl-info     /usr/bin/mxl-info
+COPY --from=nvnmos /opt/nvnmos/lib/libnvnmos.so          /usr/lib/x86_64-linux-gnu/
 
-EXPOSE 9102
+EXPOSE 9102 3212
 ENTRYPOINT ["/usr/bin/mxl-reader"]
