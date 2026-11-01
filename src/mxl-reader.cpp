@@ -10,9 +10,12 @@
 // on /metrics and as JSON on /status; /delivering answers 200 only while every
 // connected flow delivers.
 //
-// With --nmos-seed the reader is also an NMOS Node (AMWA IS-04, IS-05 and
-// BCP-007-03): each named reader slot is an MXL Receiver a controller connects
-// to a flow, and a connection moves that slot's reader to the flow named.
+// With --nmos-seed the reader is also an NMOS Node, served by libnvnmos (AMWA
+// IS-04, IS-05 and BCP-007-03): each named reader slot is an MXL Receiver a
+// controller connects to a flow, and a connection moves that slot's reader to
+// the flow named. With --nmos-control-port each Receiver also has an AMWA
+// BCP-008-01 monitor on IS-12, whose statuses and counters come from the
+// slot's counts.
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -39,7 +42,9 @@
 #include <optional>
 #include <regex>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <CLI/CLI.hpp>
@@ -53,6 +58,7 @@
 #include <mxl/flowinfo.h>
 #include <mxl/mxl.h>
 #include <mxl/time.h>
+#include <nvnmos.h>
 #include <picojson/wrapper.h>
 
 #include "checks.hpp"
@@ -155,6 +161,14 @@ namespace
         std::uint64_t lastErrorAt = 0;
         std::deque<GrainEvent> events;
         std::uint64_t eventSeq = 0;
+
+        // What the slot's BCP-008 monitor answers from: the counts of the
+        // last poll, and those of the monitor's last counter reset. Written by
+        // the poll and by libnvnmos's reset callback, read by its counters
+        // callback; apart from mutex, which a ring view may hold for a while.
+        std::mutex monitorMutex;
+        std::optional<mxlMonitoringFlowSnapshot> latest;
+        std::optional<mxlMonitoringFlowSnapshot> baseline;
 
         void record(GrainEvent event)
         {
@@ -861,16 +875,13 @@ namespace
         switch (code)
         {
             case 200: return "OK";
-            case 400: return "Bad Request";
             case 404: return "Not Found";
-            case 405: return "Method Not Allowed";
-            case 501: return "Not Implemented";
             case 503: return "Service Unavailable";
         }
         return "Internal Server Error";
     }
 
-    void serve(int port, std::vector<std::unique_ptr<FlowStats>> const& flows, mxlMonitoring monitoring, reader::nmos::Node* node)
+    void serve(int port, std::vector<std::unique_ptr<FlowStats>> const& flows, mxlMonitoring monitoring)
     {
         auto const fd = ::socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0)
@@ -906,19 +917,6 @@ namespace
             }
             auto request = reader::parseRequest(reader::readRequest(client, RequestBudget));
             request.path = reader::collapseSlashes(request.path);
-            // The NMOS APIs take GET and PATCH, and OPTIONS from a browser
-            // before a PATCH; everything else here is read.
-            if (node != nullptr && request.path.starts_with("/x-nmos/"))
-            {
-                auto const preflight = request.method == "OPTIONS";
-                auto const reply = preflight ? reader::nmos::Reply{.code = 200, .body = ""} : node->handle(request.method, request.path, request.body);
-                auto const response = fmt::format("HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n{}"
-                                                  "Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    reply.code, reason(reply.code), reader::corsHeaders(preflight), reply.body.size(), reply.body);
-                reader::sendAll(client, response, RequestBudget);
-                ::close(client);
-                continue;
-            }
             auto const path = request.method == "GET" ? request.path : std::string{};
 
             if (path == "/stream")
@@ -1007,81 +1005,152 @@ namespace
         return json.get("id").get<std::string>();
     }
 
-    // Registers the node with an IS-04 Registration API and keeps it
-    // registered: a heartbeat every five seconds, registration again when
-    // the registry has dropped the node, and a receiver posted again when its
-    // subscription changes.
-    void registerNode(reader::nmos::Node& node, std::string const& host, int port)
+    // The NMOS Node, served by libnvnmos: one MXL Receiver per slot, named by
+    // the slot's key. Its callbacks reach the slots through user_data.
+    struct Node
     {
-        constexpr auto Budget = std::chrono::seconds{5};
-        constexpr auto Resource = "/x-nmos/registration/v1.3/resource";
-        auto const post = [&](std::string const& type, std::string const& data) {
-            auto const r = reader::request(host, port, "POST", Resource, fmt::format("{{\"type\":\"{}\",\"data\":{}}}", type, data), Budget);
-            if (r.code != 200 && r.code != 201)
+        NvNmosNodeServer server{};
+        std::vector<std::unique_ptr<FlowStats>> const* flows = nullptr;
+        // The MXL domain's id from its domain_def.json; empty when unknown.
+        std::string domainId;
+        bool registry = false;
+    };
+
+    FlowStats* slotNamed(NvNmosNodeServer* server, NvNmosSide side, char const* name)
+    {
+        if (side != NVNMOS_SIDE_RECEIVER || name == nullptr)
+        {
+            return nullptr;
+        }
+        for (auto const& flow : *static_cast<Node const*>(server->user_data)->flows)
+        {
+            if (flow->id == name)
             {
-                std::fprintf(stderr, "nmos: registering a %s failed: %d %s\n", type.c_str(), r.code, r.body.substr(0, 300).c_str());
-                return false;
+                return flow.get();
             }
-            return true;
-        };
-        auto registered = false;
+        }
+        return nullptr;
+    }
+
+    // libnvnmos calls this once nmos-cpp has applied an IS-05 activation,
+    // immediate or scheduled, to its model: /active already reports it, and a
+    // false return is only logged. A slot whose activation cannot be applied
+    // reads nothing rather than the flow before, which /active no longer
+    // names.
+    bool onActivated(NvNmosNodeServer* server, NvNmosSide side, char const* name, char const* transportFile)
+    {
+        auto* const slot = slotNamed(server, side, name);
+        if (slot == nullptr)
+        {
+            std::fprintf(stderr, "nmos: activation for unknown %s %s\n", side == NVNMOS_SIDE_SENDER ? "sender" : "receiver",
+                name != nullptr ? name : "");
+            return false;
+        }
+        auto error = std::string{};
+        auto const flow = reader::nmos::connectedFlow(transportFile, static_cast<Node const*>(server->user_data)->domainId, error);
+        retarget(*slot, flow);
+        if (!error.empty())
+        {
+            std::fprintf(stderr, "nmos: %s: %s, reading nothing\n", name, error.c_str());
+            return false;
+        }
+        std::fprintf(stderr, "nmos: %s connected to %s\n", name, flow.empty() ? "nothing" : flow.c_str());
+        return true;
+    }
+
+    // libnvnmos calls these on an IS-12 thread holding its model lock, so
+    // they work on what the last poll left and never call into it.
+    std::size_t onCounters(NvNmosNodeServer* server, NvNmosSide side, char const* name, NvNmosMonitorCounters which,
+        NvNmosMonitorCounter* counters, std::size_t maxCounters)
+    {
+        auto* const slot = slotNamed(server, side, name);
+        if (slot == nullptr || (which != NVNMOS_MONITOR_COUNTERS_LOST && which != NVNMOS_MONITOR_COUNTERS_LATE))
+        {
+            return 0;
+        }
+        auto values = std::vector<mxlMonitoringBcp008Counter>{};
+        {
+            auto const lock = std::lock_guard{slot->monitorMutex};
+            if (slot->latest)
+            {
+                values = reader::nmos::counters(slot->baseline, *slot->latest,
+                    which == NVNMOS_MONITOR_COUNTERS_LOST ? MXL_MONITORING_BCP008_LOST : MXL_MONITORING_BCP008_LATE);
+            }
+        }
+        auto const count = std::min(values.size(), maxCounters);
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            // The library's names and descriptions are static.
+            counters[i] = NvNmosMonitorCounter{.name = values[i].name, .value = values[i].value, .description = values[i].description};
+        }
+        return count;
+    }
+
+    // A Controller's ResetCounters, or nmos-cpp's own on an activation with
+    // autoResetCounters: counting starts again from the last poll.
+    void onReset(NvNmosNodeServer* server, NvNmosSide side, char const* name)
+    {
+        if (auto* const slot = slotNamed(server, side, name))
+        {
+            auto const lock = std::lock_guard{slot->monitorMutex};
+            slot->baseline = slot->latest;
+        }
+    }
+
+    void onLog(NvNmosNodeServer* server, char const*, int, char const* message)
+    {
+        // Without a registry nmos-cpp still says every few seconds that it
+        // found none, which is what was asked of it.
+        if (!static_cast<Node const*>(server->user_data)->registry && std::string_view{message}.starts_with("Did not discover a suitable"))
+        {
+            return;
+        }
+        std::fprintf(stderr, "nmos: %s\n", message);
+    }
+
+    // Once a second, hands each connected slot's monitor the statuses its
+    // counts since the poll before decide, and keeps the counts for the
+    // counters callback. A slot a controller disconnected has its monitor
+    // inactive already, and one moving to another flow is judged once its
+    // reader has moved.
+    void pollMonitors(Node& node, mxlMonitoring monitoring)
+    {
+        constexpr NvNmosMonitorDomain Domains[] = {NVNMOS_MONITOR_DOMAIN_LINK, NVNMOS_MONITOR_DOMAIN_CONNECTION,
+            NVNMOS_MONITOR_DOMAIN_SYNCHRONIZATION, NVNMOS_MONITOR_DOMAIN_STREAM};
+        auto const& flows = *node.flows;
         while (!stopping)
         {
-            // A fixed period, whatever the requests took, so a slow registry
-            // does not stretch the heartbeat towards its expiry.
-            auto const due = std::chrono::steady_clock::now() + std::chrono::seconds{5};
-            if (!registered)
+            auto const due = std::chrono::steady_clock::now() + std::chrono::seconds{1};
+            auto const counts = snapshots(monitoring);
+            for (std::size_t i = 0; i < flows.size() && i < counts.size(); ++i)
             {
-                node.takeChanged();
-                registered = true;
-                for (auto const& [type, data] : node.resources())
+                auto& slot = *flows[i];
+                auto const& current = counts[i];
+                auto previous = std::optional<mxlMonitoringFlowSnapshot>{};
                 {
-                    if (!post(type, data))
-                    {
-                        registered = false;
-                        break;
-                    }
+                    auto const lock = std::lock_guard{slot.monitorMutex};
+                    previous = std::exchange(slot.latest, current);
                 }
-                if (registered)
-                {
-                    std::fprintf(stderr, "nmos: node %s registered with %s:%d\n", node.nodeId().c_str(), host.c_str(), port);
-                }
-            }
-            else
-            {
-                // A receiver update the registry missed is sent again with a
-                // full registration, or the registry keeps the old state.
-                for (auto const& data : node.takeChanged())
-                {
-                    if (!post("receiver", data))
-                    {
-                        registered = false;
-                    }
-                }
-                if (!registered)
+                if (current.target[0] == '\0' || targetOf(slot).first != current.target)
                 {
                     continue;
                 }
-                auto const r = reader::request(host, port, "POST", "/x-nmos/registration/v1.3/health/nodes/" + node.nodeId(), "", Budget);
-                if (r.code == 404)
+                auto const statuses = reader::nmos::judge(previous, current);
+                for (std::size_t d = 0; d < statuses.size(); ++d)
                 {
-                    std::fprintf(stderr, "nmos: the registry dropped the node, registering again\n");
-                    registered = false;
-                    continue;
-                }
-                if (r.code != 200)
-                {
-                    std::fprintf(stderr, "nmos: heartbeat failed: %d\n", r.code);
+                    auto const& status = statuses[d];
+                    if (status.status != MXL_MONITORING_BCP008_UNCHANGED &&
+                        !nmos_monitor_set_status(&node.server, NVNMOS_SIDE_RECEIVER, slot.id.c_str(), Domains[d], status.status,
+                            status.message[0] != '\0' ? status.message : nullptr))
+                    {
+                        std::fprintf(stderr, "nmos: could not report the status of the monitor of %s\n", slot.id.c_str());
+                    }
                 }
             }
             while (!stopping && std::chrono::steady_clock::now() < due)
             {
                 std::this_thread::sleep_for(std::chrono::milliseconds{100});
             }
-        }
-        if (registered)
-        {
-            reader::request(host, port, "DELETE", std::string{Resource} + "/nodes/" + node.nodeId(), "", std::chrono::seconds{2});
         }
     }
 
@@ -1101,7 +1170,7 @@ int main(int argc, char** argv)
     auto expect = std::string{};
     app.add_option("--expect", expect, "JSON object of what each flow should carry, keyed by flow id or slot name.");
     auto port = 9102;
-    app.add_option("-p,--port", port, "Port of the metrics, status and NMOS endpoints.");
+    app.add_option("-p,--port", port, "Port of the ring view, metrics and status endpoints.");
     auto reportSeconds = 10;
     app.add_option("--report-interval", reportSeconds, "Seconds between summary lines on stderr. 0 disables them.");
     auto nmosSeed = std::string{};
@@ -1114,6 +1183,11 @@ int main(int argc, char** argv)
     app.add_option("--nmos-host", nmosHost, "Host the registry and controllers reach this node at. Empty: the hostname.");
     auto nmosLabel = std::string{"mxl-reader"};
     app.add_option("--nmos-label", nmosLabel, "Label of the NMOS node and device.");
+    auto nmosPort = 3212;
+    app.add_option("--nmos-port", nmosPort, "Port of the NMOS Node and Connection APIs. 0: nmos-cpp's own port for each API.");
+    auto nmosControlPort = 0;
+    app.add_option("--nmos-control-port", nmosControlPort,
+        "Port of the IS-12 Control Protocol, with a BCP-008-01 monitor per Receiver. 0: no IS-12.");
     CLI11_PARSE(app, argc, argv);
 
     // libmxl answers a malformed id as an invalid argument, which the read loop
@@ -1147,6 +1221,15 @@ int main(int argc, char** argv)
         }
         keys.push_back(slot.key);
         slots.push_back(std::move(slot));
+    }
+    if (!nmosSeed.empty())
+    {
+        auto const inRange = [](int p) { return p >= 0 && p <= 65535; };
+        if (!inRange(nmosPort) || !inRange(nmosControlPort) || nmosPort == port || (nmosControlPort != 0 && (nmosControlPort == port || nmosControlPort == nmosPort)))
+        {
+            std::fprintf(stderr, "--port, --nmos-port and --nmos-control-port must be distinct ports\n");
+            return 2;
+        }
     }
     auto registryHost = std::string{};
     auto registryPort = 80;
@@ -1220,7 +1303,9 @@ int main(int argc, char** argv)
         }
     }
 
-    auto node = std::unique_ptr<reader::nmos::Node>{};
+    auto node = Node{};
+    node.flows = &flows;
+    auto running = false;
     if (!nmosSeed.empty())
     {
         if (nmosHost.empty())
@@ -1229,19 +1314,13 @@ int main(int argc, char** argv)
             ::gethostname(name, sizeof(name) - 1);
             nmosHost = name;
         }
-        auto const domainIdValue = domainId(domain);
-        if (domainIdValue.empty())
+        node.domainId = domainId(domain);
+        if (node.domainId.empty())
         {
-            std::fprintf(stderr, "nmos: %s/domain_def.json names no domain id; a connection that names a domain is refused\n",
+            std::fprintf(stderr, "nmos: %s/domain_def.json names no domain id; a connection that names a domain is not applied\n",
                 domain.c_str());
         }
-        node = std::make_unique<reader::nmos::Node>(
-            reader::nmos::NodeConfig{.seed = nmosSeed, .label = nmosLabel, .description = "mxl-reader", .host = nmosHost,
-                .port = port, .domainId = domainIdValue},
-            [&flows](std::size_t slot, std::string const& flow) {
-                retarget(*flows.at(slot), flow);
-                return std::string{};
-            });
+        auto definitions = std::vector<std::string>{};
         for (std::size_t i = 0; i < slots.size(); ++i)
         {
             auto constraints = std::optional<reader::nmos::Constraints>{};
@@ -1250,10 +1329,73 @@ int main(int argc, char** argv)
                 constraints = reader::nmos::Constraints{.width = e->width, .height = e->height, .rate = e->rate,
                     .sampleRate = e->sampleRate, .channels = e->channels};
             }
-            node->addReceiver(slots[i].name, slots[i].kind, constraints, slots[i].flow);
+            definitions.push_back(reader::nmos::flowDefinition(slots[i], constraints, node.domainId, ""));
         }
-        std::fprintf(stderr, "nmos: node %s with %zu receiver%s at %s:%d\n", node->nodeId().c_str(), slots.size(),
-            slots.size() == 1 ? "" : "s", nmosHost.c_str(), port);
+        auto receivers = std::vector<NvNmosReceiverConfig>(slots.size());
+        for (std::size_t i = 0; i < receivers.size(); ++i)
+        {
+            receivers[i] = NvNmosReceiverConfig{.transport = NVNMOS_TRANSPORT_MXL, .transport_file = definitions[i].c_str()};
+        }
+        // An address given as the host is the one address advertised, rather
+        // than every address of every interface nmos-cpp finds.
+        auto address = in_addr{};
+        char const* hostAddresses[] = {nmosHost.c_str()};
+        auto const isAddress = ::inet_pton(AF_INET, nmosHost.c_str(), &address) == 1;
+        auto services = NvNmosNetworkServicesConfig{};
+        node.registry = !registryHost.empty();
+        if (node.registry)
+        {
+            // A registry named by address serves the IS-09 System API as well,
+            // or the node keeps looking for one.
+            services.registration_address = registryHost.c_str();
+            services.registration_port = static_cast<unsigned int>(registryPort);
+            services.system_address = registryHost.c_str();
+            services.system_port = static_cast<unsigned int>(registryPort);
+        }
+        else
+        {
+            // libnvnmos's way of saying no registry: without it nmos-cpp looks
+            // for one over DNS-SD.
+            services.registration_port = 65535;
+        }
+        auto config = NvNmosNodeConfig{};
+        config.host_name = nmosHost.c_str();
+        config.host_addresses = isAddress ? hostAddresses : nullptr;
+        config.num_host_addresses = isAddress ? 1 : 0;
+        config.http_port = static_cast<unsigned int>(nmosPort);
+        config.label = nmosLabel.c_str();
+        config.description = "mxl-reader";
+        config.seed = nmosSeed.c_str();
+        config.receivers = receivers.data();
+        config.num_receivers = static_cast<unsigned int>(receivers.size());
+        config.connection_activated = &onActivated;
+        config.log_callback = &onLog;
+        config.log_level = NVNMOS_LOG_WARNING;
+        config.network_services = &services;
+        auto control = NvNmosControlProtocolConfig{.port = static_cast<unsigned int>(nmosControlPort), .get_counters = &onCounters,
+            .reset_counters = &onReset};
+        node.server.user_data = &node;
+        if (!(nmosControlPort != 0 ? create_nmos_node_server_with_control_protocol(&config, &control, &node.server)
+                                   : create_nmos_node_server(&config, &node.server)))
+        {
+            std::fprintf(stderr, "nmos: the NMOS Node did not start on :%d\n", nmosPort);
+            return 1;
+        }
+        running = true;
+        // A slot booked with a flow reads it without a controller having
+        // asked, and the Node says so rather than presenting it as idle.
+        for (auto const& slot : slots)
+        {
+            if (!slot.flow.empty() && !nmos_connection_activate(&node.server, NVNMOS_SIDE_RECEIVER, slot.key.c_str(),
+                                          reader::nmos::flowDefinition(slot, std::nullopt, node.domainId, slot.flow).c_str()))
+            {
+                std::fprintf(stderr, "nmos: could not report %s as connected to %s\n", slot.key.c_str(), slot.flow.c_str());
+            }
+        }
+        char nodeId[NVNMOS_ID_LEN] = {};
+        nmos_get_node_id(&node.server, nodeId, sizeof(nodeId));
+        std::fprintf(stderr, "nmos: node %s with %zu receiver%s at %s:%d%s\n", nodeId, slots.size(), slots.size() == 1 ? "" : "s",
+            nmosHost.c_str(), nmosPort, nmosControlPort != 0 ? fmt::format(", IS-12 at :{}", nmosControlPort).c_str() : "");
     }
 
     // The counts pushed over OTLP/HTTP as well, with the events a poll thread
@@ -1288,10 +1430,10 @@ int main(int argc, char** argv)
                 }
             });
     }
-    threads.emplace_back(serve, port, std::cref(flows), monitoring, node.get());
-    if (node && !registryHost.empty())
+    threads.emplace_back(serve, port, std::cref(flows), monitoring);
+    if (running && nmosControlPort != 0)
     {
-        threads.emplace_back(registerNode, std::ref(*node), registryHost, registryPort);
+        threads.emplace_back(pollMonitors, std::ref(node), monitoring);
     }
 
     auto previous = std::vector<std::uint64_t>(flows.size(), 0);
@@ -1327,6 +1469,11 @@ int main(int argc, char** argv)
     for (auto& thread : threads)
     {
         thread.join();
+    }
+    // Deregisters the node; its callbacks reach the slots until it returns.
+    if (running)
+    {
+        destroy_nmos_node_server(&node.server);
     }
     if (otlp != nullptr)
     {

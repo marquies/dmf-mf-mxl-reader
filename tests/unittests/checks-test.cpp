@@ -194,18 +194,42 @@ namespace
         ::close(pair.server);
     }
 
-    void nmosHttp()
+    void paths()
     {
-        check(reader::collapseSlashes("/x-nmos/connection/v1.1//single/receivers/") == "/x-nmos/connection/v1.1/single/receivers/",
-            "an href ending in '/' joined with '/single' reaches the Connection API");
-        check(reader::collapseSlashes("//x-nmos///node/v1.3") == "/x-nmos/node/v1.3", "every run of slashes becomes one");
+        check(reader::collapseSlashes("//status") == "/status", "an href ending in '/' joined with '/status' reaches it");
+        check(reader::collapseSlashes("//a///b") == "/a/b", "every run of slashes becomes one");
         check(reader::collapseSlashes("/metrics") == "/metrics", "a path without doubled slashes is kept");
-        check(reader::corsHeaders(false) == "Access-Control-Allow-Origin: *\r\n", "every NMOS response lets a page of any origin read it");
-        auto const preflight = reader::corsHeaders(true);
-        check(preflight.find("Access-Control-Allow-Origin: *\r\n") != std::string::npos
-                && preflight.find("Access-Control-Allow-Methods: GET, PATCH, OPTIONS\r\n") != std::string::npos
-                && preflight.find("Access-Control-Allow-Headers: Content-Type") != std::string::npos,
-            "a preflight allows the PATCH and the JSON body a controller sends");
+    }
+
+    // A request with a body is read through it; the body may follow the
+    // headers in a later segment.
+    void requestBodies()
+    {
+        auto const raw = std::string{"PATCH /a/b?y=1 HTTP/1.1\r\nHost: r\r\nContent-Length: 2\r\n\r\n{}"};
+        auto const r = reader::parseRequest(raw);
+        check(r.method == "PATCH" && r.path == "/a/b" && r.body == "{}", "a request's method, path and body are taken apart");
+        check(reader::header("X\r\ncontent-LENGTH:  12 \r\n", "Content-Length") == "12", "a header is found without regard to case");
+
+        int fds[2];
+        check(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0, "a socket pair opens");
+        auto const head = std::string{"PATCH /s HTTP/1.1\r\nContent-Length: 11\r\n\r\n"};
+        auto received = std::string{};
+        auto server = std::thread{[&] { received = reader::readRequest(fds[0], std::chrono::seconds{2}); }};
+        ::send(fds[1], head.data(), head.size(), MSG_NOSIGNAL);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        ::send(fds[1], "{\"a\":\"bcd\"}", 11, MSG_NOSIGNAL);
+        server.join();
+        ::close(fds[0]);
+        ::close(fds[1]);
+        check(received == head + "{\"a\":\"bcd\"}", "a body that arrives after the headers is read too");
+
+        // A length that is no number must not take the reader down.
+        check(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0, "a socket pair opens");
+        auto const bad = std::string{"PATCH /s HTTP/1.1\r\nContent-Length: lots\r\n\r\n"};
+        ::send(fds[1], bad.data(), bad.size(), MSG_NOSIGNAL);
+        check(reader::readRequest(fds[0], std::chrono::milliseconds{200}) == bad, "a malformed length reads as no body");
+        ::close(fds[0]);
+        ::close(fds[1]);
     }
 }
 
@@ -215,7 +239,8 @@ int main()
     conversion();
     longRequest();
     stalledClients();
-    nmosHttp();
+    paths();
+    requestBodies();
     if (failures == 0)
     {
         std::fprintf(stderr, "all checks pass\n");

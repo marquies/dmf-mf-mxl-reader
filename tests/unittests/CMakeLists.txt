@@ -29,6 +29,8 @@ target_sources(mxl-reader-nmos-tests PRIVATE nmos-test.cpp)
 target_include_directories(mxl-reader-nmos-tests PRIVATE "${MXL_READER_SOURCE_DIR}")
 target_link_libraries(mxl-reader-nmos-tests
         PRIVATE
+            mxl
+            mxl-monitoring
             fmt::fmt
             picojson::picojson
     )
