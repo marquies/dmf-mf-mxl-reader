@@ -16,8 +16,8 @@ ARG MXL_REF=c259243931333497e61faabeedac8048915dcb2b
 # into the same tree and linked statically. Checked out by commit, which a
 # moved tag cannot change; the tag names the release it is.
 # renovate: datasource=github-tags depName=marquies/libmxl-monitoring
-ARG MONITORING_TAG=v0.4.0
-ARG MONITORING_REF=8a3ec560da3773319c788fe2ecd6d838784d1557
+ARG MONITORING_TAG=v0.6.0
+ARG MONITORING_REF=449f446ca2ce341e3a885bce6c204fe071870253
 
 # libnvnmos, NVIDIA's C API over nmos-cpp, serves the NMOS Node, patched with
 # IS-12 and BCP-008 monitors. Its dependencies take the better part of an hour
