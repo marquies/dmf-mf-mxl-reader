@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.0.0-rc.10](https://github.com/marquies/dmf-mf-mxl-reader/compare/v1.0.0-rc.9...v1.0.0-rc.10) (2026-11-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* **nmos:** the NMOS APIs move from --port to --nmos-port (3212). Receiver, device and node ids derive from the seed as libnvnmos derives them, so they differ from before. A Receiver whose --expect leaves part of its format open states no constraint sets.
+
+### Features
+
+* **nmos:** serve the NMOS Node through libnvnmos, with IS-12 ([#22](https://github.com/marquies/dmf-mf-mxl-reader/issues/22)) ([84a0807](https://github.com/marquies/dmf-mf-mxl-reader/commit/84a0807abd47009bf14d1429fba7c2f1feb6a8f7))
+
+
+### Bug Fixes
+
+* **deps:** move onto go-mxl 1.1.0-rc.14 and its libmxl ([#24](https://github.com/marquies/dmf-mf-mxl-reader/issues/24)) ([c3ee584](https://github.com/marquies/dmf-mf-mxl-reader/commit/c3ee5847b11c04253dc52a10ec1003209ad973a9))
+* **deps:** move onto go-mxl 1.1.0-rc.15 ([#25](https://github.com/marquies/dmf-mf-mxl-reader/issues/25)) ([b5748fc](https://github.com/marquies/dmf-mf-mxl-reader/commit/b5748fc5a4f0722015e05f1ce6a03f889a56900e))
+
 ## [1.0.0-rc.9](https://github.com/marquies/dmf-mf-mxl-reader/compare/v1.0.0-rc.8...v1.0.0-rc.9) (2026-10-29)
 
 
