@@ -5,12 +5,12 @@
 # so reader, writer and gateway share one libmxl ABI and one flow layout.
 
 # renovate: datasource=docker depName=ghcr.io/qvest-digital/go-mxl-builder
-ARG GO_MXL_TAG=1.1.0-rc.7
+ARG GO_MXL_TAG=1.1.0-rc.14
 
 # MXL_SRC and MXL_REF are the repository and commit named in go-mxl's
 # .github/libmxl.version at GO_MXL_TAG: the libmxl go-mxl-runtime ships.
 ARG MXL_SRC=https://github.com/qvest-digital/mxl.git
-ARG MXL_REF=c259243931333497e61faabeedac8048915dcb2b
+ARG MXL_REF=121615e37950e8ca2cc4a7b82e8e4a065a0cb323
 
 # libmxl-monitoring counts, checks and renders what the reader reads; built
 # into the same tree and linked statically. Checked out by commit, which a
